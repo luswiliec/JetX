@@ -86,12 +86,25 @@ async fn health() -> impl Responder {
 }
 
 async fn run_websocket_monitor() {
+    let mut reconnect_delay = 5;
     loop {
+        println!("\n🔄 Starting WebSocket monitor...");
         match monitor_jetx().await {
-            Ok(_) => println!("WebSocket connection closed normally"),
-            Err(e) => eprintln!("WebSocket error: {}. Reconnecting in 5 seconds...", e),
+            Ok(_) => {
+                println!("WebSocket connection closed normally");
+                reconnect_delay = 5; // Reset delay on normal close
+            }
+            Err(e) => {
+                eprintln!("❌ WebSocket error: {}. Reconnecting in {} seconds...", e, reconnect_delay);
+            }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        
+        tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay)).await;
+        
+        // Don't increase delay too much to ensure quick reconnection
+        if reconnect_delay < 30 {
+            reconnect_delay += 5;
+        }
     }
 }
 
@@ -112,8 +125,9 @@ async fn monitor_jetx() -> Result<(), Box<dyn std::error::Error>> {
     let mut round_counter = 0;
     let mut round_stats = RoundStats::new();
     let mut ping_counter = 0u32;
+    let mut last_activity = tokio::time::Instant::now();
     
-    // Spawn timer ping task
+    // Spawn timer ping task - send every 2 seconds
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<u32>(100);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
@@ -127,18 +141,33 @@ async fn monitor_jetx() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     
+    // Spawn inactivity checker - reconnect if no data for 60 seconds
+    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if activity_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    
     loop {
         tokio::select! {
             // Handle incoming messages
             message = read.next() => {
+                last_activity = tokio::time::Instant::now();
+                
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                            // Check for TimerPing response
-                            if let Some(i_value) = json["I"].as_str() {
+                            // Check for TimerPing response (I and R fields)
+                            if json.get("I").is_some() && json.get("R").is_some() {
+                                let i_value = json["I"].as_str().or_else(|| json["I"].as_u64().map(|v| v.to_string().leak() as &str)).unwrap_or("?");
                                 if let Some(r_obj) = json["R"].as_object() {
                                     if let Some(o_value) = r_obj.get("o") {
-                                        println!("🏓 TimerPing Response: I: {}, R: {{o: {}}}", i_value, o_value);
+                                        println!("🏓 TimerPing Response: I: \"{}\", R: {{o: {}}}", i_value, o_value);
                                         continue;
                                     }
                                 }
@@ -168,14 +197,17 @@ async fn monitor_jetx() -> Result<(), Box<dyn std::error::Error>> {
                         write.send(Message::Pong(data)).await?;
                     }
                     Some(Ok(Message::Close(frame))) => {
-                        println!("\n🔌 Connection closed: {:?}", frame);
-                        break;
+                        println!("\n🔌 Connection closed by server: {:?}", frame);
+                        return Ok(());
                     }
                     Some(Err(e)) => {
-                        eprintln!("❌ Error: {}", e);
-                        break;
+                        eprintln!("❌ Error receiving message: {}", e);
+                        return Err(Box::new(e));
                     }
-                    None => break,
+                    None => {
+                        println!("\n🔌 Connection stream ended");
+                        return Ok(());
+                    }
                     _ => {}
                 }
             }
@@ -197,12 +229,23 @@ async fn monitor_jetx() -> Result<(), Box<dyn std::error::Error>> {
                 
                 let ping_str = serde_json::to_string(&ping_msg)?;
                 println!("🏓 Sending TimerPing: I: {}", ping_counter);
-                write.send(Message::Text(ping_str)).await?;
+                
+                if let Err(e) = write.send(Message::Text(ping_str)).await {
+                    eprintln!("❌ Error sending ping: {}", e);
+                    return Err(Box::new(e));
+                }
+            }
+            
+            // Check for inactivity timeout
+            _ = activity_rx.recv() => {
+                let inactive_duration = tokio::time::Instant::now().duration_since(last_activity);
+                if inactive_duration > tokio::time::Duration::from_secs(120) {
+                    println!("\n⚠️  No activity for 120 seconds, reconnecting...");
+                    return Ok(());
+                }
             }
         }
     }
-    
-    Ok(())
 }
 
 fn process_message(json: &Value, game_state: &mut GameState, round_counter: &mut i32, round_stats: &mut RoundStats) {
