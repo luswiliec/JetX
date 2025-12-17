@@ -1,462 +1,399 @@
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{StreamExt, SinkExt};
+use futures_util::{SinkExt, StreamExt};
+use csv::Writer;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use chrono::{DateTime, Utc};
+use std::error::Error;
+use std::fs::OpenOptions;
+use std::collections::HashMap;
 use std::env;
 use actix_web::{get, App, HttpResponse, HttpServer, Responder};
-use reqwest;
 
-#[derive(Debug, PartialEq)]
-enum GameState {
-    AcceptingBets,
-    PlaneStarted,
-    Flying,
-    Crashed,
-    BoardLoaded,
-}
-
-struct RoundStats {
+#[derive(Debug, Serialize, Deserialize)]
+struct GameRound {
+    date: String,
+    time: String,
+    crash_multiplier: f64,
+    flight_duration: f64,
     total_bets_usd: f64,
+    total_players_bet: usize,
     total_cashouts_usd: f64,
-    bet_leak_shown: bool,
-    cashouts: Vec<CashoutInfo>,
+    total_players_cashed_out: usize,
+    profit_usd: f64,
+    players_lost: usize,
 }
 
-struct CashoutInfo {
+#[derive(Debug, Clone)]
+struct PlayerBet {
     username: String,
-    bet_usd: f64,
-    bet_local: String,
+    player_id: String,
+    bet_amount_usd: f64,
     currency: String,
+    bet_number: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlayerCashout {
+    username: String,
+    player_id: String,
+    bet_amount_usd: f64,
     multiplier: f64,
-    won_usd: f64,
+    cashout_amount_usd: f64,
 }
 
-impl RoundStats {
+#[derive(Debug)]
+struct RoundTracker {
+    bets: HashMap<String, PlayerBet>,
+    cashouts: Vec<PlayerCashout>,
+    start_time: Option<DateTime<Utc>>,
+    crash_multiplier: f64,
+    flight_duration: f64,
+    is_active: bool,
+}
+
+impl RoundTracker {
     fn new() -> Self {
-        RoundStats {
-            total_bets_usd: 0.0,
-            total_cashouts_usd: 0.0,
-            bet_leak_shown: false,
+        Self {
+            bets: HashMap::new(),
             cashouts: Vec::new(),
+            start_time: None,
+            crash_multiplier: 0.0,
+            flight_duration: 0.0,
+            is_active: false,
         }
     }
-    
+
     fn reset(&mut self) {
-        self.total_bets_usd = 0.0;
-        self.total_cashouts_usd = 0.0;
-        self.bet_leak_shown = false;
+        self.bets.clear();
         self.cashouts.clear();
+        self.start_time = None;
+        self.crash_multiplier = 0.0;
+        self.flight_duration = 0.0;
+        self.is_active = false;
     }
-    
-    fn add_cashout(&mut self, username: String, bet_usd: f64, bet_local: String, currency: String, multiplier: f64, won_usd: f64) {
-        self.total_cashouts_usd += won_usd;
-        self.cashouts.push(CashoutInfo {
-            username,
-            bet_usd,
-            bet_local,
-            currency,
-            multiplier,
-            won_usd,
-        });
-    }
-    
-    fn print_sorted_cashouts(&mut self) {
-        // Sort by multiplier in ascending order
-        self.cashouts.sort_by(|a, b| a.multiplier.partial_cmp(&b.multiplier).unwrap());
+
+    fn calculate_stats(&self) -> GameRound {
+        let total_bets_usd: f64 = self.bets.values().map(|b| b.bet_amount_usd).sum();
+        let total_cashouts_usd: f64 = self.cashouts.iter().map(|c| c.cashout_amount_usd).sum();
+        let total_players_bet = self.bets.len();
+        let total_players_cashed_out = self.cashouts.len();
+        // Safely calculate players lost - handle case where cashouts might exceed bets
+        let players_lost = if total_players_cashed_out > total_players_bet {
+            0
+        } else {
+            total_players_bet - total_players_cashed_out
+        };
+        let profit_usd = total_bets_usd - total_cashouts_usd;
+
+        let start_time = self.start_time.unwrap_or_else(Utc::now);
         
-        if !self.cashouts.is_empty() {
-            println!("\n💸 CASHOUTS (sorted by multiplier - ascending order):");
-            println!("{}", "-".repeat(80));
-            for cashout in &self.cashouts {
-                println!("   {} | Bet: ${} ({} {}) | Cashed out at: {:.2}x | Won: ${}", 
-                    cashout.username, cashout.bet_usd, cashout.bet_local, 
-                    cashout.currency, cashout.multiplier, cashout.won_usd);
-            }
-            println!("{}", "-".repeat(80));
+        GameRound {
+            date: start_time.format("%Y-%m-%d").to_string(),
+            time: start_time.format("%H:%M:%S").to_string(),
+            crash_multiplier: (self.crash_multiplier * 100.0).round() / 100.0,
+            flight_duration: (self.flight_duration * 100.0).round() / 100.0,
+            total_bets_usd: (total_bets_usd * 100.0).round() / 100.0,
+            total_players_bet,
+            total_cashouts_usd: (total_cashouts_usd * 100.0).round() / 100.0,
+            total_players_cashed_out,
+            profit_usd: (profit_usd * 100.0).round() / 100.0,
+            players_lost,
         }
     }
 }
 
+fn parse_player_data(data_str: &str) -> Option<Vec<String>> {
+    // Split by underscore: username_bet_local_mult_cashout_id_betnum_currency_unknown
+    let parts: Vec<&str> = data_str.split('_').collect();
+    if parts.len() >= 9 {
+        Some(parts.iter().map(|s| s.to_string()).collect())
+    } else {
+        None
+    }
+}
+
+// HTTP endpoints for keeping the service alive
 #[get("/")]
 async fn hello() -> impl Responder {
-    println!("📡 Health check received at /");
-    HttpResponse::Ok().body("JetX WebSocket Monitor is running!")
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok",
+        "service": "JetX Game Data Monitor",
+        "uptime": "running"
+    }))
 }
 
 #[get("/health")]
 async fn health() -> impl Responder {
-    println!("📡 Health check received at /health");
-    HttpResponse::Ok().body("OK")
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "timestamp": Utc::now().to_rfc3339()
+    }))
 }
 
 #[get("/status")]
 async fn status() -> impl Responder {
-    println!("📡 Status check received");
-    use std::time::SystemTime;
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    
     HttpResponse::Ok().json(serde_json::json!({
-        "status": "running",
-        "service": "jetx-monitor",
-        "timestamp": timestamp
+        "status": "monitoring",
+        "service": "JetX WebSocket Monitor",
+        "timestamp": Utc::now().to_rfc3339()
     }))
 }
 
+// WebSocket monitoring function
 async fn run_websocket_monitor() {
-    let mut reconnect_delay = 5;
     loop {
-        println!("\n🔄 Starting WebSocket monitor...");
         match monitor_jetx().await {
             Ok(_) => {
-                println!("WebSocket connection closed normally");
-                reconnect_delay = 5; // Reset delay on normal close
+                println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
             }
             Err(e) => {
-                eprintln!("❌ WebSocket error: {}. Reconnecting in {} seconds...", e, reconnect_delay);
+                eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
             }
         }
-        
-        tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_delay)).await;
-        
-        // Don't increase delay too much to ensure quick reconnection
-        if reconnect_delay < 30 {
-            reconnect_delay += 5;
-        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
-// Heartbeat to keep service active and prevent Koyeb from sleeping
-async fn heartbeat() {
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30)); // Every 30 seconds
-    interval.tick().await; // Skip first tick
-    
-    loop {
-        interval.tick().await;
-        println!("💓 Heartbeat: Service is active and running");
-    }
-}
+async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
-async fn monitor_jetx() -> Result<(), Box<dyn std::error::Error>> {
-    let ws_url = env::var("WS_URL").unwrap_or_else(|_| 
-        "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=9b781e6b-66cf-4c27-af1d-108a66f7c77a&group=JetX&connectionToken=gY20tsEI3EJ0d4LQFAoTCVLqD7ZmXiC%2FZKHqy67RJLm7pukW%2FaEg22lUMCwxZNJNP0OtdK8c9KX%2FW21OXTaG0SlLHbivEAUDGR%2FcbMLrNI3pCz2dZwvVjBj%2BcjmyBNe2&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=0".to_string()
-    );
-    
-    println!("🚀 Connecting to JetX WebSocket...");
-    println!("{}", "=".repeat(80));
-    
-    let (ws_stream, _response) = connect_async(&ws_url).await?;
-    println!("✅ Connected to JetX!\n");
-    
+    println!("🔌 Connecting to WebSocket: {}", ws_url);
+
+    let (ws_stream, _) = connect_async(ws_url).await?;
+    println!("✅ WebSocket connection established");
+
     let (mut write, mut read) = ws_stream.split();
-    
-    let mut game_state = GameState::AcceptingBets;
-    let mut round_counter = 0;
-    let mut round_stats = RoundStats::new();
-    let mut ping_counter = 0u32;
-    let mut last_activity = tokio::time::Instant::now();
-    
-    // Get port for self-ping
-    let port = env::var("PORT").unwrap_or("8000".to_string());
-    let health_url = format!("http://localhost:{}/health", port);
-    
-    // Spawn timer ping task - send every 2 seconds
-    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<u32>(100);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-        interval.tick().await; // Skip first immediate tick
-        
-        loop {
-            interval.tick().await;
-            if ping_tx.send(1).await.is_err() {
-                break;
-            }
-        }
-    });
-    
-    // Spawn HTTP self-ping task - ping our own health endpoint every 60 seconds
-    let health_url_clone = health_url.clone();
-    let (http_ping_tx, mut http_ping_rx) = tokio::sync::mpsc::channel::<()>(100);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        interval.tick().await;
-        
-        loop {
-            interval.tick().await;
-            if http_ping_tx.send(()).await.is_err() {
-                break;
-            }
-        }
-    });
-    
-    // Spawn inactivity checker - reconnect if no data for 120 seconds
-    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if activity_tx.send(()).await.is_err() {
-                break;
-            }
-        }
-    });
-    
-    loop {
-        tokio::select! {
-            // Handle incoming messages
-            message = read.next() => {
-                last_activity = tokio::time::Instant::now();
-                
-                match message {
-                    Some(Ok(Message::Text(text))) => {
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(true)
+        .open("jetx_game_data.csv")?;
+
+    let mut csv_writer = Writer::from_writer(file);
+
+    // Check if file is empty to write header
+    let metadata = std::fs::metadata("jetx_game_data.csv")?;
+    if metadata.len() == 0 {
+        csv_writer.write_record(&[
+            "Date",
+            "Time",
+            "Crash Multiplier",
+            "Flight Duration (s)",
+            "Total Bets (USD)",
+            "Total Players Bet",
+            "Total Cashouts (USD)",
+            "Total Players Cashed Out",
+            "Profit (USD)",
+            "Players Lost (Bet but No Cashout)",
+        ])?;
+        csv_writer.flush()?;
+    }
+
+    println!("📊 Listening for JetX game data...");
+    println!("⚠️  NOTE: First round will be skipped (in-progress round)");
+    println!("{}", "=".repeat(80));
+
+    let mut round_tracker = RoundTracker::new();
+    let mut round_count = 0;
+    let mut first_round_seen = false;
+    let mut message_counter = 0;
+
+    while let Some(message) = read.next().await {
+        match message {
+            Ok(msg) => {
+                match msg {
+                    Message::Text(text) => {
+                        message_counter += 1;
+                        
+                        println!("\n[MSG #{}] Received at {}", message_counter, Utc::now().format("%H:%M:%S%.3f"));
+                        
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                            // Check for TimerPing response (I and R fields)
-                            if json.get("I").is_some() && json.get("R").is_some() {
-                                let i_value = json["I"].as_str().or_else(|| json["I"].as_u64().map(|v| v.to_string().leak() as &str)).unwrap_or("?");
-                                if let Some(r_obj) = json["R"].as_object() {
-                                    if let Some(o_value) = r_obj.get("o") {
-                                        println!("🏓 TimerPing Response: I: \"{}\", R: {{o: {}}}", i_value, o_value);
-                                        continue;
+                            if let Some(messages) = json["M"].as_array() {
+                                for (idx, msg_obj) in messages.iter().enumerate() {
+                                    println!("  [Sub-message {}]", idx + 1);
+                                    
+                                    if let Some(method) = msg_obj["M"].as_str() {
+                                        if method == "response" {
+                                            if let Some(args) = msg_obj["A"].as_array() {
+                                                if let Some(arg) = args.first() {
+                                                    let f = arg["f"].as_bool().unwrap_or(false);
+                                                    let v = arg["v"].as_f64().unwrap_or(0.0);
+                                                    let s = arg["s"].as_f64().unwrap_or(0.0);
+
+                                                    println!("    Response: f={}, v={}, s={}", f, v, s);
+
+                                                    if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
+                                                        round_tracker.start_time = Some(Utc::now());
+                                                        round_tracker.is_active = true;
+                                                        round_count += 1;
+                                                        println!("\n🚀 [ROUND {}] FLIGHT STARTED at {}", 
+                                                            round_count, 
+                                                            Utc::now().format("%H:%M:%S"));
+                                                        println!("{}", "-".repeat(80));
+                                                    } else if !f && round_tracker.is_active {
+                                                        round_tracker.crash_multiplier = v;
+                                                        round_tracker.flight_duration = s;
+                                                        print!("\r📈 Multiplier: {:.2}x | Time: {:.2}s", v, s);
+                                                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                                                    } else if f && round_tracker.is_active {
+                                                        round_tracker.crash_multiplier = v;
+                                                        round_tracker.flight_duration = s;
+                                                        println!("\n\n💥 CRASHED at {:.2}x (Duration: {:.2}s)", v, s);
+                                                        println!("{}", "-".repeat(80));
+
+                                                        let round_stats = round_tracker.calculate_stats();
+                                                        
+                                                        println!("\n📊 ROUND {} SUMMARY:", round_count);
+                                                        println!("   Total Bets: ${:.2} from {} players", 
+                                                            round_stats.total_bets_usd, 
+                                                            round_stats.total_players_bet);
+                                                        println!("   Total Cashouts: ${:.2} from {} players", 
+                                                            round_stats.total_cashouts_usd, 
+                                                            round_stats.total_players_cashed_out);
+                                                        println!("   Profit (House): ${:.2}", round_stats.profit_usd);
+                                                        println!("   Players Lost: {}", round_stats.players_lost);
+
+                                                        if first_round_seen {
+                                                            println!("   ✅ Saved to CSV");
+                                                            csv_writer.serialize(&round_stats)?;
+                                                            csv_writer.flush()?;
+                                                        } else {
+                                                            println!("   ⚠️  SKIPPED (First incomplete round)");
+                                                            first_round_seen = true;
+                                                        }
+                                                        
+                                                        println!("{}", "=".repeat(80));
+
+                                                        round_tracker.reset();
+                                                    }
+                                                }
+                                            }
+                                        } else if method == "g" {
+                                            if let Some(args) = msg_obj["A"].as_array() {
+                                                if let Some(arg) = args.first() {
+                                                    if let Some(action_type) = arg["M"].as_str() {
+                                                        println!("    Action type: {}", action_type);
+                                                        
+                                                        if let Some(info) = arg["I"].as_object() {
+                                                            if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
+                                                                println!("    Data: {}", data);
+                                                                
+                                                                if let Some(parts) = parse_player_data(data) {
+                                                                    if action_type == "b" && parts.len() >= 9 {
+                                                                        let mult: f64 = parts[3].parse().unwrap_or(0.0);
+                                                                        let cashout: f64 = parts[4].parse().unwrap_or(0.0);
+                                                                        
+                                                                        if mult == 0.0 && cashout == 0.0 {
+                                                                            let bet = PlayerBet {
+                                                                                username: parts[0].clone(),
+                                                                                player_id: parts[5].clone(),
+                                                                                bet_amount_usd: parts[1].parse().unwrap_or(0.0),
+                                                                                currency: parts[7].clone(),
+                                                                                bet_number: parts[6].clone(),
+                                                                            };
+                                                                            
+                                                                            let key = format!("{}_{}", bet.player_id, bet.bet_number);
+                                                                            println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
+                                                                                bet.username,
+                                                                                bet.player_id,
+                                                                                bet.bet_amount_usd,
+                                                                                bet.currency,
+                                                                                bet.bet_number);
+                                                                            
+                                                                            round_tracker.bets.insert(key, bet);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
+                                                                        }
+                                                                    } else if action_type == "c" && parts.len() >= 9 {
+                                                                        let mult: f64 = parts[3].parse().unwrap_or(0.0);
+                                                                        let cashout_amt: f64 = parts[4].parse().unwrap_or(0.0);
+                                                                        
+                                                                        if mult > 0.0 && cashout_amt > 0.0 {
+                                                                            let cashout = PlayerCashout {
+                                                                                username: parts[0].clone(),
+                                                                                player_id: parts[5].clone(),
+                                                                                bet_amount_usd: parts[1].parse().unwrap_or(0.0),
+                                                                                multiplier: mult,
+                                                                                cashout_amount_usd: cashout_amt,
+                                                                            };
+                                                                            
+                                                                            println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
+                                                                                cashout.username,
+                                                                                cashout.player_id,
+                                                                                cashout.bet_amount_usd,
+                                                                                cashout.multiplier,
+                                                                                cashout.cashout_amount_usd);
+                                                                            
+                                                                            round_tracker.cashouts.push(cashout);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
+                                                                        }
+                                                                    } else {
+                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
+                                                                    }
+                                                                } else {
+                                                                    println!("    ⚠️  Failed to parse player data");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            println!("    Unknown method: {}", method);
+                                        }
+                                    } else {
+                                        println!("    No method field found");
                                     }
                                 }
+                            } else {
+                                println!("  No M array in message");
                             }
-                            
-                            // Check if message contains multiple items
-                            let has_multiple = json["M"].as_array()
-                                .map(|arr| arr.len() > 1)
-                                .unwrap_or(false);
-                            
-                            if has_multiple {
-                                println!("\n{}", "─".repeat(80));
-                                println!("📦 PACKET START (Multiple messages in one packet)");
-                                println!("{}", "─".repeat(80));
-                            }
-                            
-                            process_message(&json, &mut game_state, &mut round_counter, &mut round_stats);
-                            
-                            if has_multiple {
-                                println!("{}", "─".repeat(80));
-                                println!("📦 PACKET END");
-                                println!("{}", "─".repeat(80));
-                            }
+                        } else {
+                            println!("  Failed to parse as JSON");
                         }
                     }
-                    Some(Ok(Message::Ping(data))) => {
+
+                    Message::Binary(data) => {
+                        message_counter += 1;
+                        println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
+                    }
+
+                    Message::Ping(data) => {
+                        println!("\n[PING] Received, sending pong...");
                         write.send(Message::Pong(data)).await?;
                     }
-                    Some(Ok(Message::Close(frame))) => {
-                        println!("\n🔌 Connection closed by server: {:?}", frame);
-                        return Ok(());
-                    }
-                    Some(Err(e)) => {
-                        eprintln!("❌ Error receiving message: {}", e);
-                        return Err(Box::new(e));
-                    }
-                    None => {
-                        println!("\n🔌 Connection stream ended");
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            
-            // Handle sending TimerPing every 2 seconds
-            _ = ping_rx.recv() => {
-                ping_counter += 1;
-                let ping_msg = serde_json::json!({
-                    "H": "h",
-                    "M": "TimerPing",
-                    "A": [format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}", 
-                        rand::random::<u32>(), 
-                        rand::random::<u16>(), 
-                        rand::random::<u16>(), 
-                        rand::random::<u16>(), 
-                        rand::random::<u64>() & 0xFFFFFFFFFFFF)],
-                    "I": ping_counter
-                });
-                
-                let ping_str = serde_json::to_string(&ping_msg)?;
-                println!("🏓 Sending TimerPing: I: {}", ping_counter);
-                
-                if let Err(e) = write.send(Message::Text(ping_str)).await {
-                    eprintln!("❌ Error sending ping: {}", e);
-                    return Err(Box::new(e));
-                }
-            }
-            
-            // Handle HTTP self-ping every 60 seconds to keep Koyeb active
-            _ = http_ping_rx.recv() => {
-                match reqwest::get(&health_url_clone).await {
-                    Ok(_) => println!("💓 HTTP keep-alive ping successful - preventing sleep"),
-                    Err(e) => eprintln!("⚠️  HTTP keep-alive ping failed: {}", e),
-                }
-            }
-            
-            // Check for inactivity timeout
-            _ = activity_rx.recv() => {
-                let inactive_duration = tokio::time::Instant::now().duration_since(last_activity);
-                if inactive_duration > tokio::time::Duration::from_secs(120) {
-                    println!("\n⚠️  No activity for 120 seconds, reconnecting...");
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
 
-fn process_message(json: &Value, game_state: &mut GameState, round_counter: &mut i32, round_stats: &mut RoundStats) {
-    if let Some(messages) = json["M"].as_array() {
-        for msg in messages {
-            let method = msg["M"].as_str().unwrap_or("");
-            
-            match method {
-                "response" => {
-                    if let Some(args) = msg["A"].as_array() {
-                        for arg in args {
-                            process_flight_data(arg, game_state, round_counter, round_stats);
-                        }
+                    Message::Pong(_) => {
+                        println!("\n[PONG] Received");
                     }
-                }
-                "g" => {
-                    if let Some(args) = msg["A"].as_array() {
-                        for arg in args {
-                            process_bet_data(arg, game_state, round_stats);
-                        }
+
+                    Message::Close(frame) => {
+                        println!("\n[CLOSE] Connection closed by server: {:?}", frame);
+                        break;
                     }
-                }
-                "gBoard" => {
-                    if *game_state == GameState::Crashed {
-                        println!("\n📊 gBoard message received - Round data loaded");
-                        println!("{}", "=".repeat(80));
-                        println!("⚠️  Any CASHOUTS after this point are DATA LEAKS:");
-                        println!("{}", "-".repeat(80));
-                        round_stats.reset();
-                        *game_state = GameState::AcceptingBets;
-                    }
-                }
-                "TimerPing" => {}
-                _ => {
-                    if method != "" {
-                        println!("\n⚠️  Unknown message type: {}", method);
-                        println!("{}", serde_json::to_string_pretty(&msg).unwrap_or_default());
+
+                    Message::Frame(_) => {
+                        message_counter += 1;
+                        println!("\n[MSG #{}] Frame message", message_counter);
                     }
                 }
             }
-        }
-    }
-}
 
-fn process_flight_data(data: &Value, game_state: &mut GameState, round_counter: &mut i32, round_stats: &mut RoundStats) {
-    let fallen = data["f"].as_bool().unwrap_or(false);
-    let multiplier = data["v"].as_f64().unwrap_or(0.0);
-    let time = data["s"].as_f64().unwrap_or(0.0);
-    
-    if multiplier == 1.0 && time == 0.0 && !fallen {
-        if *game_state == GameState::AcceptingBets {
-            *round_counter += 1;
-            *game_state = GameState::PlaneStarted;
-            
-            println!("\n{}", "=".repeat(80));
-            println!("📊 BETTING PHASE COMPLETE");
-            println!("   Total Bets Placed (including any leaks): ${:.2}", round_stats.total_bets_usd);
-            println!("{}", "=".repeat(80));
-            
-            println!("\n🛫 ROUND #{} - PLANE HAS STARTED! (v=1, s=0)", round_counter);
-            println!("{}", "=".repeat(80));
-        }
-        return;
-    }
-    
-    if !fallen && (*game_state == GameState::PlaneStarted || *game_state == GameState::Flying) {
-        if *game_state == GameState::PlaneStarted {
-            *game_state = GameState::Flying;
-        }
-        println!("✈️  Multiplier: {:.2}x | Time: {:.2}s | Status: FLYING", multiplier, time);
-        return;
-    }
-    
-    if fallen {
-        if *game_state == GameState::Flying || *game_state == GameState::PlaneStarted {
-            *game_state = GameState::Crashed;
-            println!("\n💥 PLANE CRASHED!");
-            println!("   Crash Multiplier: {:.2}x", multiplier);
-            println!("   Flight Time: {:.2}s", time);
-            
-            round_stats.print_sorted_cashouts();
-            
-            println!("\n📊 ROUND SUMMARY:");
-            println!("   Total Bets Placed: ${:.2}", round_stats.total_bets_usd);
-            println!("   Total Cashouts: ${:.2}", round_stats.total_cashouts_usd);
-            println!("{}", "=".repeat(80));
-        } else {
-            println!("⚠️  [DATA LEAK] Received crash message after round ended (v={:.2}x, s={:.2}s)", multiplier, time);
-        }
-        return;
-    }
-}
-
-fn process_bet_data(data: &Value, game_state: &mut GameState, round_stats: &mut RoundStats) {
-    if let Some(bet_type) = data["M"].as_str() {
-        if let Some(info) = data["I"]["a"].as_str() {
-            let parts: Vec<&str> = info.split('_').collect();
-            
-            if parts.len() >= 9 {
-                let username = parts[0];
-                let bet_usd = parts[1].parse::<f64>().unwrap_or(0.0);
-                let bet_local = parts[2];
-                let cashout_multiplier = parts[3].parse::<f64>().unwrap_or(0.0);
-                let cashout_usd = parts[4].parse::<f64>().unwrap_or(0.0);
-                let random_id = parts[5];
-                let _flag = parts[6];
-                let currency = parts[7];
-                let _status = parts[8];
-                
-                match bet_type {
-                    "b" => {
-                        if cashout_multiplier == 0.0 && cashout_usd == 0.0 {
-                            round_stats.total_bets_usd += bet_usd;
-                            
-                            if *game_state == GameState::AcceptingBets {
-                                println!("💰 BET PLACED: {} | ${} ({} {}) [ID: {}] → Total Bets: ${:.2}", 
-                                    username, bet_usd, bet_local, currency, random_id, round_stats.total_bets_usd);
-                            } 
-                            else {
-                                if !round_stats.bet_leak_shown {
-                                    println!("\n{}", "=".repeat(80));
-                                    println!("⚠️  BET DATA LEAKS (Bets placed after plane started):");
-                                    println!("{}", "-".repeat(80));
-                                    round_stats.bet_leak_shown = true;
-                                }
-                                println!("⚠️  [BET LEAK] {} | ${} ({} {}) [ID: {}] → Total Bets: ${:.2}", 
-                                    username, bet_usd, bet_local, currency, random_id, round_stats.total_bets_usd);
-                            }
-                        }
-                    }
-                    "c" => {
-                        if cashout_multiplier > 1.0 && cashout_usd > 0.0 {
-                            if *game_state == GameState::Flying {
-                                round_stats.add_cashout(
-                                    username.to_string(),
-                                    bet_usd,
-                                    bet_local.to_string(),
-                                    currency.to_string(),
-                                    cashout_multiplier,
-                                    cashout_usd
-                                );
-                                println!("💸 Cashout detected: {} at {:.2}x", username, cashout_multiplier);
-                            } 
-                            else if *game_state == GameState::Crashed || *game_state == GameState::AcceptingBets {
-                                println!("⚠️  [DATA LEAK - CASHOUT] {} | Bet: ${} | Multiplier: {:.2}x | Won: ${} [ID: {}]", 
-                                    username, bet_usd, cashout_multiplier, cashout_usd, random_id);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            Err(e) => {
+                eprintln!("\n[ERROR] Error receiving message: {}", e);
+                return Err(e.into());
             }
         }
     }
+
+    println!("\n\n=== CONNECTION ENDED ===");
+    println!("Total messages received: {}", message_counter);
+    println!("Total rounds tracked: {}", round_count);
+    
+    Ok(())
 }
 
 #[actix_web::main]
@@ -465,20 +402,18 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or("8000".to_string())
         .parse()
         .unwrap();
-
-    println!("🌐 Starting web server on port {}", port);
-    println!("💓 Heartbeat enabled - service will stay active");
+    
+    println!("🚀 Starting JetX Monitor Service");
+    println!("🌐 Web server on port {}", port);
+    println!("💓 Configure cron-job.org to ping: http://your-app.koyeb.app/health");
+    println!("   Recommended: Every 5 minutes");
+    println!("{}", "=".repeat(80));
     
     // Spawn WebSocket monitor as a background task
     tokio::spawn(async {
         run_websocket_monitor().await;
     });
     
-    // Spawn heartbeat to keep service active
-    tokio::spawn(async {
-        heartbeat().await;
-    });
-
     // Start HTTP server
     HttpServer::new(|| {
         App::new()
