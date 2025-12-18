@@ -1,4 +1,4 @@
-I have put this endpoint on my app. is it okay:
+
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use futures_util::{StreamExt, SinkExt};
 use serde_json::Value;
