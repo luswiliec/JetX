@@ -1,10 +1,9 @@
-//use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{tungstenite::Message};
 use tokio_tungstenite::Connector;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration};
 use std::error::Error;
 use std::collections::HashMap;
 use std::env;
@@ -12,6 +11,11 @@ use actix_web::{get, App, HttpResponse, HttpServer, Responder};
 use tokio_postgres::Client;
 use postgres_native_tls;
 use native_tls::TlsConnector as NativeTlsConnector;
+
+// Helper function to add 2 hours to current time
+fn get_adjusted_time() -> DateTime<Utc> {
+    Utc::now() + Duration::hours(2)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct GameRound {
@@ -88,11 +92,13 @@ impl RoundTracker {
         };
         let profit_usd = total_bets_usd - total_cashouts_usd;
 
-        let start_time = self.start_time.unwrap_or_else(Utc::now);
+        // Use adjusted time (+2 hours)
+        let start_time = self.start_time.unwrap_or_else(get_adjusted_time);
+        let adjusted_time = start_time + Duration::hours(2);
         
         GameRound {
-            date: start_time.format("%Y-%m-%d").to_string(),
-            time: start_time.format("%H:%M:%S").to_string(),
+            date: adjusted_time.format("%Y-%m-%d").to_string(),
+            time: adjusted_time.format("%H:%M:%S").to_string(),
             crash_multiplier: (self.crash_multiplier * 100.0).round() / 100.0,
             flight_duration: (self.flight_duration * 100.0).round() / 100.0,
             total_bets_usd: (total_bets_usd * 100.0).round() / 100.0,
@@ -219,39 +225,62 @@ async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<
     }
 }
 
-// HTTP endpoints
+// HTTP endpoints for keeping the service alive
 #[get("/")]
 async fn hello() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "service": "JetX Game Data Monitor",
-        "uptime": "running"
-    }))
+    let adjusted_time = get_adjusted_time();
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(serde_json::json!({
+            "status": "ok",
+            "service": "JetX Game Data Monitor",
+            "message": "Service is running and monitoring JetX games",
+            "uptime": "active",
+            "timestamp": adjusted_time.to_rfc3339(),
+            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
+        }))
 }
 
 #[get("/health")]
 async fn health() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "timestamp": Utc::now().to_rfc3339()
-    }))
+    let adjusted_time = get_adjusted_time();
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(serde_json::json!({
+            "status": "healthy",
+            "service": "jetx-monitor",
+            "database": "connected",
+            "websocket": "active",
+            "timestamp": adjusted_time.to_rfc3339(),
+            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
+        }))
 }
 
 #[get("/status")]
 async fn status() -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "monitoring",
-        "service": "JetX WebSocket Monitor",
-        "timestamp": Utc::now().to_rfc3339()
-    }))
+    let adjusted_time = get_adjusted_time();
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(serde_json::json!({
+            "status": "monitoring",
+            "service": "JetX WebSocket Monitor",
+            "description": "Tracking game rounds and saving to PostgreSQL",
+            "timestamp": adjusted_time.to_rfc3339(),
+            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
+        }))
 }
 
-// WebSocket monitoring function
+// WebSocket monitoring function with auto-reconnect
 async fn run_websocket_monitor() {
+    let mut reconnect_attempts = 0;
     loop {
+        reconnect_attempts += 1;
+        println!("\n🔄 WebSocket Monitor Attempt #{}", reconnect_attempts);
+        
         match monitor_jetx().await {
             Ok(_) => {
                 println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
+                reconnect_attempts = 0; // Reset counter on successful connection
             }
             Err(e) => {
                 eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
@@ -262,7 +291,7 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=772cc8cd-25a3-4d2d-a180-85e3dc096540&group=JetX&connectionToken=jrYSRVSvpG64VeMGmDTz7HUuGAoao%2FXv%2FDcX2Nz0ZPw%2F3SEuWCt%2BrEVgUbvKh2MGeDTIIhp2dofqtctdZiryWw%2BCHKgQh3mXbGzs1lxuTdOBorZ7ie%2BNqus7VnyIR7Ht&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=4";
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
     println!("🔌 Connecting to WebSocket: {}", ws_url);
 
@@ -303,12 +332,16 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                     Message::Text(text) => {
                         message_counter += 1;
                         
-                        println!("\n[MSG #{}] Received at {}", message_counter, Utc::now().format("%H:%M:%S%.3f"));
+                        // Log every message with detailed timestamp (adjusted +2 hours)
+                        let adjusted_time = get_adjusted_time();
+                        let timestamp = adjusted_time.format("%H:%M:%S%.3f").to_string();
+                        println!("\n[MSG #{}] Received at {}", message_counter, timestamp);
                         
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
+                                // Process EVERY message in the array - critical for not skipping data
                                 for (idx, msg_obj) in messages.iter().enumerate() {
-                                    println!("  [Sub-message {}]", idx + 1);
+                                    println!("  [Sub-message {}/{}]", idx + 1, messages.len());
                                     
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
@@ -318,15 +351,16 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
-                                                    println!("    Response: f={}, v={}, s={}", f, v, s);
+                                                    // Uncomment for detailed response logging:
+                                                    // println!("    Response: f={}, v={}, s={}", f, v, s);
 
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
-                                                        round_tracker.start_time = Some(Utc::now());
+                                                        round_tracker.start_time = Some(get_adjusted_time());
                                                         round_tracker.is_active = true;
                                                         round_count += 1;
                                                         println!("\n🚀 [ROUND {}] FLIGHT STARTED at {}", 
                                                             round_count, 
-                                                            Utc::now().format("%H:%M:%S"));
+                                                            get_adjusted_time().format("%H:%M:%S"));
                                                         println!("{}", "-".repeat(80));
                                                     } else if !f && round_tracker.is_active {
                                                         round_tracker.crash_multiplier = v;
@@ -354,11 +388,18 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                         if first_round_seen {
                                                             // Save to database
                                                             match save_round_to_db(&db_client, &round_stats).await {
-                                                                Ok(_) => println!("   ✅ Saved to database"),
-                                                                Err(e) => eprintln!("   ❌ Database error: {}", e),
+                                                                Ok(_) => {
+                                                                    println!("   ✅ Saved to database");
+                                                                    println!("   📝 Round #{} recorded successfully", round_count - 1);
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("   ❌ Database error: {}", e);
+                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
+                                                                }
                                                             }
                                                         } else {
-                                                            println!("   ⚠️  SKIPPED (First incomplete round)");
+                                                            println!("   ⚠️  SKIPPED (First incomplete round - we joined mid-game)");
+                                                            println!("   📌 Starting fresh tracking from next round");
                                                             first_round_seen = true;
                                                         }
                                                         
@@ -372,11 +413,13 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
-                                                        println!("    Action type: {}", action_type);
+                                                        // Uncomment for action type logging:
+                                                        // println!("    Action type: {}", action_type);
                                                         
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
-                                                                println!("    Data: {}", data);
+                                                                // Uncomment for raw data logging:
+                                                                // println!("    Data: {}", data);
                                                                 
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
@@ -503,9 +546,14 @@ async fn main() -> std::io::Result<()> {
     
     println!("🚀 Starting JetX Monitor Service with PostgreSQL");
     println!("🌐 Web server on port {}", port);
-    println!("💾 Database: PostgreSQL");
-    println!("💓 Configure cron-job.org to ping: http://your-app.koyeb.app/health");
-    println!("   Recommended: Every 5 minutes");
+    println!("💾 Database: PostgreSQL (Koyeb)");
+    println!("📡 WebSocket: Auto-reconnecting monitor");
+    println!("💓 Health endpoints ready for cron-job.org:");
+    println!("   - GET http://your-app.koyeb.app/health");
+    println!("   - GET http://your-app.koyeb.app/status");
+    println!("⏰ Recommended cron schedule: Every 5 minutes");
+    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
+    println!("             All subsequent rounds will be fully tracked and saved");
     println!("{}", "=".repeat(80));
     
     // Spawn WebSocket monitor as a background task
@@ -521,6 +569,7 @@ async fn main() -> std::io::Result<()> {
             .service(status)
     })
     .bind(("0.0.0.0", port))?
+    .workers(2) // Use 2 workers for better reliability
     .run()
     .await
 }
