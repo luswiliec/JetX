@@ -92,9 +92,8 @@ impl RoundTracker {
         };
         let profit_usd = total_bets_usd - total_cashouts_usd;
 
-        // Use adjusted time (+2 hours)
-        let start_time = self.start_time.unwrap_or_else(get_adjusted_time);
-        let adjusted_time = start_time + Duration::hours(2);
+        // Use start_time directly (already adjusted when stored)
+        let adjusted_time = self.start_time.unwrap_or_else(get_adjusted_time);
         
         GameRound {
             date: adjusted_time.format("%Y-%m-%d").to_string(),
@@ -291,7 +290,7 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=f56d8585-2083-457e-ad99-55f451fab230&group=JetX&connectionToken=cQFhaIAMakpskdxRYvbNsTvqu90IxhJ%2BDuB67JN6r10o7ckETvSPufn8ZfduFPFX2gzUMdrgP9lZ9ZVXyPPfRsm1jgKgJAMGf%2FmgHh7MFzOyRtfKzsu8kNtduVkX5oLm&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
     println!("🔌 Connecting to WebSocket: {}", ws_url);
 
