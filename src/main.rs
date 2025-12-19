@@ -1,11 +1,9 @@
-//use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_tungstenite::Connector;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-// ADDED: Duration imported here for time calculation
-use chrono::{DateTime, Utc, Duration}; 
+use chrono::{DateTime, Utc};
 use std::error::Error;
 use std::collections::HashMap;
 use std::env;
@@ -91,13 +89,9 @@ impl RoundTracker {
 
         let start_time = self.start_time.unwrap_or_else(Utc::now);
         
-        // --- UPDATED: Add 2 hours to the time ---
-        let adjusted_time = start_time + Duration::hours(2);
-
         GameRound {
-            // Use adjusted_time instead of start_time
-            date: adjusted_time.format("%Y-%m-%d").to_string(),
-            time: adjusted_time.format("%H:%M:%S").to_string(),
+            date: start_time.format("%Y-%m-%d").to_string(),
+            time: start_time.format("%H:%M:%S").to_string(),
             crash_multiplier: (self.crash_multiplier * 100.0).round() / 100.0,
             flight_duration: (self.flight_duration * 100.0).round() / 100.0,
             total_bets_usd: (total_bets_usd * 100.0).round() / 100.0,
@@ -251,12 +245,17 @@ async fn status() -> impl Responder {
     }))
 }
 
-// WebSocket monitoring function
+// WebSocket monitoring function with auto-reconnect
 async fn run_websocket_monitor() {
+    let mut reconnect_attempts = 0;
     loop {
+        reconnect_attempts += 1;
+        println!("\n🔄 WebSocket Monitor Attempt #{}", reconnect_attempts);
+        
         match monitor_jetx().await {
             Ok(_) => {
                 println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
+                reconnect_attempts = 0; // Reset counter on successful connection
             }
             Err(e) => {
                 eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
@@ -267,7 +266,7 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=772cc8cd-25a3-4d2d-a180-85e3dc096540&group=JetX&connectionToken=jrYSRVSvpG64VeMGmDTz7HUuGAoao%2FXv%2FDcX2Nz0ZPw%2F3SEuWCt%2BrEVgUbvKh2MGeDTIIhp2dofqtctdZiryWw%2BCHKgQh3mXbGzs1lxuTdOBorZ7ie%2BNqus7VnyIR7Ht&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=4";
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
     println!("🔌 Connecting to WebSocket: {}", ws_url);
 
@@ -308,13 +307,15 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                     Message::Text(text) => {
                         message_counter += 1;
                         
-                        // Keeping the basic message counter log (can be commented if too noisy, but user asked for bets/cashouts)
-                        println!("\n[MSG #{}] Received at {}", message_counter, Utc::now().format("%H:%M:%S%.3f"));
+                        // Log every message with detailed timestamp
+                        let timestamp = Utc::now().format("%H:%M:%S%.3f").to_string();
+                        println!("\n[MSG #{}] Received at {}", message_counter, timestamp);
                         
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
+                                // Process EVERY message in the array - critical for not skipping data
                                 for (idx, msg_obj) in messages.iter().enumerate() {
-                                    // println!("  [Sub-message {}]", idx + 1); // Optional: Comment this out if needed
+                                    println!("  [Sub-message {}/{}]", idx + 1, messages.len());
                                     
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
@@ -324,7 +325,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
-                                                    // println!("    Response: f={}, v={}, s={}", f, v, s); // Optional: Comment this out
+                                                    println!("    Response: f={}, v={}, s={}", f, v, s);
 
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
                                                         round_tracker.start_time = Some(Utc::now());
@@ -360,11 +361,18 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                         if first_round_seen {
                                                             // Save to database
                                                             match save_round_to_db(&db_client, &round_stats).await {
-                                                                Ok(_) => println!("   ✅ Saved to database"),
-                                                                Err(e) => eprintln!("   ❌ Database error: {}", e),
+                                                                Ok(_) => {
+                                                                    println!("   ✅ Saved to database");
+                                                                    println!("   📝 Round #{} recorded successfully", round_count - 1);
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!("   ❌ Database error: {}", e);
+                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
+                                                                }
                                                             }
                                                         } else {
-                                                            println!("   ⚠️  SKIPPED (First incomplete round)");
+                                                            println!("   ⚠️  SKIPPED (First incomplete round - we joined mid-game)");
+                                                            println!("   📌 Starting fresh tracking from next round");
                                                             first_round_seen = true;
                                                         }
                                                         
@@ -378,13 +386,11 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
-                                                        // [LOG COMMENTED OUT] Action type log
-                                                        // println!("    Action type: {}", action_type);
+                                                        println!("    Action type: {}", action_type);
                                                         
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
-                                                                // [LOG COMMENTED OUT] Raw data log
-                                                                // println!("    Data: {}", data);
+                                                                println!("    Data: {}", data);
                                                                 
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
@@ -401,17 +407,16 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
-                                                                            // [LOG COMMENTED OUT] Bet log
-                                                                            /*
                                                                             println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
                                                                                 bet.username,
                                                                                 bet.player_id,
                                                                                 bet.bet_amount_usd,
                                                                                 bet.currency,
                                                                                 bet.bet_number);
-                                                                            */
                                                                             
                                                                             round_tracker.bets.insert(key, bet);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -426,22 +431,22 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
-                                                                            // [LOG COMMENTED OUT] Cashout log
-                                                                            /*
                                                                             println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
                                                                                 cashout.username,
                                                                                 cashout.player_id,
                                                                                 cashout.bet_amount_usd,
                                                                                 cashout.multiplier,
                                                                                 cashout.cashout_amount_usd);
-                                                                            */
                                                                             
                                                                             round_tracker.cashouts.push(cashout);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
+                                                                    } else {
+                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
                                                                     }
                                                                 } else {
-                                                                    // [LOG COMMENTED OUT] Error logs for parsing
-                                                                    // println!("    ⚠️  Failed to parse player data");
+                                                                    println!("    ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
@@ -449,23 +454,23 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                 }
                                             }
                                         } else {
-                                            // println!("    Unknown method: {}", method);
+                                            println!("    Unknown method: {}", method);
                                         }
                                     } else {
-                                        // println!("    No method field found");
+                                        println!("    No method field found");
                                     }
                                 }
                             } else {
-                                // println!("  No M array in message");
+                                println!("  No M array in message");
                             }
                         } else {
-                            // println!("  Failed to parse as JSON");
+                            println!("  Failed to parse as JSON");
                         }
                     }
 
-                    Message::Binary(_data) => {
+                    Message::Binary(data) => {
                         message_counter += 1;
-                        //println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
+                        println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
                     }
 
                     Message::Ping(data) => {
@@ -484,7 +489,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
 
                     Message::Frame(_) => {
                         message_counter += 1;
-                       // println!("\n[MSG #{}] Frame message", message_counter);
+                        println!("\n[MSG #{}] Frame message", message_counter);
                     }
                 }
             }
@@ -512,9 +517,15 @@ async fn main() -> std::io::Result<()> {
     
     println!("🚀 Starting JetX Monitor Service with PostgreSQL");
     println!("🌐 Web server on port {}", port);
-    println!("💾 Database: PostgreSQL");
-    println!("💓 Configure cron-job.org to ping: http://your-app.koyeb.app/health");
-    println!("   Recommended: Every 5 minutes");
+    println!("💾 Database: PostgreSQL (Koyeb)");
+    println!("📡 WebSocket: Auto-reconnecting monitor");
+    println!("💓 Health endpoints ready for cron-job.org:");
+    println!("   - GET http://your-app.koyeb.app/health");
+    println!("   - GET http://your-app.koyeb.app/ping");
+    println!("   - GET http://your-app.koyeb.app/status");
+    println!("⏰ Recommended cron schedule: Every 5 minutes");
+    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
+    println!("             All subsequent rounds will be fully tracked and saved");
     println!("{}", "=".repeat(80));
     
     // Spawn WebSocket monitor as a background task
@@ -528,8 +539,10 @@ async fn main() -> std::io::Result<()> {
             .service(hello)
             .service(health)
             .service(status)
+            .service(ping)
     })
     .bind(("0.0.0.0", port))?
+    .workers(2) // Use 2 workers for better reliability
     .run()
     .await
 }
