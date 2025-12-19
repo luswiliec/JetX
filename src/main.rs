@@ -4,7 +4,8 @@ use tokio_tungstenite::Connector;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use chrono::{DateTime, Utc};
+// ADDED: Duration imported here for time calculation
+use chrono::{DateTime, Utc, Duration}; 
 use std::error::Error;
 use std::collections::HashMap;
 use std::env;
@@ -90,9 +91,13 @@ impl RoundTracker {
 
         let start_time = self.start_time.unwrap_or_else(Utc::now);
         
+        // --- UPDATED: Add 2 hours to the time ---
+        let adjusted_time = start_time + Duration::hours(2);
+
         GameRound {
-            date: start_time.format("%Y-%m-%d").to_string(),
-            time: start_time.format("%H:%M:%S").to_string(),
+            // Use adjusted_time instead of start_time
+            date: adjusted_time.format("%Y-%m-%d").to_string(),
+            time: adjusted_time.format("%H:%M:%S").to_string(),
             crash_multiplier: (self.crash_multiplier * 100.0).round() / 100.0,
             flight_duration: (self.flight_duration * 100.0).round() / 100.0,
             total_bets_usd: (total_bets_usd * 100.0).round() / 100.0,
@@ -303,12 +308,13 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                     Message::Text(text) => {
                         message_counter += 1;
                         
+                        // Keeping the basic message counter log (can be commented if too noisy, but user asked for bets/cashouts)
                         println!("\n[MSG #{}] Received at {}", message_counter, Utc::now().format("%H:%M:%S%.3f"));
                         
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
                                 for (idx, msg_obj) in messages.iter().enumerate() {
-                                    println!("  [Sub-message {}]", idx + 1);
+                                    // println!("  [Sub-message {}]", idx + 1); // Optional: Comment this out if needed
                                     
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
@@ -318,7 +324,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
-                                                    println!("    Response: f={}, v={}, s={}", f, v, s);
+                                                    // println!("    Response: f={}, v={}, s={}", f, v, s); // Optional: Comment this out
 
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
                                                         round_tracker.start_time = Some(Utc::now());
@@ -372,11 +378,13 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
-                                                        println!("    Action type: {}", action_type);
+                                                        // [LOG COMMENTED OUT] Action type log
+                                                        // println!("    Action type: {}", action_type);
                                                         
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
-                                                                println!("    Data: {}", data);
+                                                                // [LOG COMMENTED OUT] Raw data log
+                                                                // println!("    Data: {}", data);
                                                                 
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
@@ -393,16 +401,17 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
-                                                                           // println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
+                                                                            // [LOG COMMENTED OUT] Bet log
+                                                                            /*
+                                                                            println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
                                                                                 bet.username,
                                                                                 bet.player_id,
                                                                                 bet.bet_amount_usd,
                                                                                 bet.currency,
                                                                                 bet.bet_number);
+                                                                            */
                                                                             
                                                                             round_tracker.bets.insert(key, bet);
-                                                                        } else {
-                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -417,22 +426,22 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
-                                                                      //      println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
+                                                                            // [LOG COMMENTED OUT] Cashout log
+                                                                            /*
+                                                                            println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
                                                                                 cashout.username,
                                                                                 cashout.player_id,
                                                                                 cashout.bet_amount_usd,
                                                                                 cashout.multiplier,
                                                                                 cashout.cashout_amount_usd);
+                                                                            */
                                                                             
                                                                             round_tracker.cashouts.push(cashout);
-                                                                        } else {
-                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
-                                                                    } else {
-                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
                                                                     }
                                                                 } else {
-                                                                    println!("    ⚠️  Failed to parse player data");
+                                                                    // [LOG COMMENTED OUT] Error logs for parsing
+                                                                    // println!("    ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
@@ -440,21 +449,21 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                 }
                                             }
                                         } else {
-                                            println!("    Unknown method: {}", method);
+                                            // println!("    Unknown method: {}", method);
                                         }
                                     } else {
-                                        println!("    No method field found");
+                                        // println!("    No method field found");
                                     }
                                 }
                             } else {
-                                println!("  No M array in message");
+                                // println!("  No M array in message");
                             }
                         } else {
-                            println!("  Failed to parse as JSON");
+                            // println!("  Failed to parse as JSON");
                         }
                     }
 
-                    Message::Binary(data) => {
+                    Message::Binary(_data) => {
                         message_counter += 1;
                         //println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
                     }
