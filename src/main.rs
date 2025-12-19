@@ -1,4 +1,5 @@
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+//use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -245,17 +246,12 @@ async fn status() -> impl Responder {
     }))
 }
 
-// WebSocket monitoring function with auto-reconnect
+// WebSocket monitoring function
 async fn run_websocket_monitor() {
-    let mut reconnect_attempts = 0;
     loop {
-        reconnect_attempts += 1;
-        println!("\n🔄 WebSocket Monitor Attempt #{}", reconnect_attempts);
-        
         match monitor_jetx().await {
             Ok(_) => {
                 println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
-                reconnect_attempts = 0; // Reset counter on successful connection
             }
             Err(e) => {
                 eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
@@ -307,15 +303,12 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                     Message::Text(text) => {
                         message_counter += 1;
                         
-                        // Log every message with detailed timestamp
-                        let timestamp = Utc::now().format("%H:%M:%S%.3f").to_string();
-                        println!("\n[MSG #{}] Received at {}", message_counter, timestamp);
+                        println!("\n[MSG #{}] Received at {}", message_counter, Utc::now().format("%H:%M:%S%.3f"));
                         
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
-                                // Process EVERY message in the array - critical for not skipping data
                                 for (idx, msg_obj) in messages.iter().enumerate() {
-                                    println!("  [Sub-message {}/{}]", idx + 1, messages.len());
+                                    println!("  [Sub-message {}]", idx + 1);
                                     
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
@@ -361,18 +354,11 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                         if first_round_seen {
                                                             // Save to database
                                                             match save_round_to_db(&db_client, &round_stats).await {
-                                                                Ok(_) => {
-                                                                    println!("   ✅ Saved to database");
-                                                                    println!("   📝 Round #{} recorded successfully", round_count - 1);
-                                                                }
-                                                                Err(e) => {
-                                                                    eprintln!("   ❌ Database error: {}", e);
-                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
-                                                                }
+                                                                Ok(_) => println!("   ✅ Saved to database"),
+                                                                Err(e) => eprintln!("   ❌ Database error: {}", e),
                                                             }
                                                         } else {
-                                                            println!("   ⚠️  SKIPPED (First incomplete round - we joined mid-game)");
-                                                            println!("   📌 Starting fresh tracking from next round");
+                                                            println!("   ⚠️  SKIPPED (First incomplete round)");
                                                             first_round_seen = true;
                                                         }
                                                         
@@ -517,15 +503,9 @@ async fn main() -> std::io::Result<()> {
     
     println!("🚀 Starting JetX Monitor Service with PostgreSQL");
     println!("🌐 Web server on port {}", port);
-    println!("💾 Database: PostgreSQL (Koyeb)");
-    println!("📡 WebSocket: Auto-reconnecting monitor");
-    println!("💓 Health endpoints ready for cron-job.org:");
-    println!("   - GET http://your-app.koyeb.app/health");
-    println!("   - GET http://your-app.koyeb.app/ping");
-    println!("   - GET http://your-app.koyeb.app/status");
-    println!("⏰ Recommended cron schedule: Every 5 minutes");
-    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
-    println!("             All subsequent rounds will be fully tracked and saved");
+    println!("💾 Database: PostgreSQL");
+    println!("💓 Configure cron-job.org to ping: http://your-app.koyeb.app/health");
+    println!("   Recommended: Every 5 minutes");
     println!("{}", "=".repeat(80));
     
     // Spawn WebSocket monitor as a background task
@@ -539,10 +519,8 @@ async fn main() -> std::io::Result<()> {
             .service(hello)
             .service(health)
             .service(status)
-            .service(ping)
     })
     .bind(("0.0.0.0", port))?
-    .workers(2) // Use 2 workers for better reliability
     .run()
     .await
 }
