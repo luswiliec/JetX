@@ -262,7 +262,7 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=772cc8cd-25a3-4d2d-a180-85e3dc096540&group=JetX&connectionToken=jrYSRVSvpG64VeMGmDTz7HUuGAoao%2FXv%2FDcX2Nz0ZPw%2F3SEuWCt%2BrEVgUbvKh2MGeDTIIhp2dofqtctdZiryWw%2BCHKgQh3mXbGzs1lxuTdOBorZ7ie%2BNqus7VnyIR7Ht&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=4";
 
     println!("🔌 Connecting to WebSocket: {}", ws_url);
 
@@ -393,7 +393,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
-                                                                            println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
+                                                                           // println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
                                                                                 bet.username,
                                                                                 bet.player_id,
                                                                                 bet.bet_amount_usd,
@@ -417,7 +417,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
-                                                                            println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
+                                                                      //      println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
                                                                                 cashout.username,
                                                                                 cashout.player_id,
                                                                                 cashout.bet_amount_usd,
@@ -456,7 +456,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
 
                     Message::Binary(data) => {
                         message_counter += 1;
-                        println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
+                        //println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
                     }
 
                     Message::Ping(data) => {
@@ -475,7 +475,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
 
                     Message::Frame(_) => {
                         message_counter += 1;
-                        println!("\n[MSG #{}] Frame message", message_counter);
+                       // println!("\n[MSG #{}] Frame message", message_counter);
                     }
                 }
             }
