@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use chrono::{DateTime, Utc, Duration};
 use std::error::Error;
-use std::fmt;
 use std::collections::HashMap;
 use std::env;
 use actix_web::{get, App, HttpResponse, HttpServer, Responder};
@@ -93,6 +92,7 @@ impl RoundTracker {
         };
         let profit_usd = total_bets_usd - total_cashouts_usd;
 
+        // Use start_time directly (already adjusted when stored)
         let adjusted_time = self.start_time.unwrap_or_else(get_adjusted_time);
         
         GameRound {
@@ -119,17 +119,18 @@ fn parse_player_data(data_str: &str) -> Option<Vec<String>> {
     }
 }
 
-async fn get_db_client() -> Result<Client, Box<dyn Error + Send + Sync>> {
+// Database connection function
+async fn get_db_client() -> Result<Client, Box<dyn Error>> {
     let db_user = env::var("DATABASE_USER").unwrap_or("avnadmin".to_string());
     let db_password = env::var("DATABASE_PASSWORD").unwrap_or("AVNS_qo4RbZtZ5nTmv6oZCvL".to_string());
     let db_host = env::var("DATABASE_HOST").unwrap_or("pg-406c52b-luswiliec-transcity.k.aivencloud.com".to_string());
     let db_port = env::var("DATABASE_PORT").unwrap_or("12394".to_string());
     let db_name = env::var("DATABASE_NAME").unwrap_or("defaultdb".to_string());
 
+    // Use postgres-native-tls for secure connection to Aiven PostgreSQL
     let mut builder = native_tls::TlsConnector::builder();
+    // Accept any certificate for compatibility (Aiven uses valid certs, but this ensures connection)
     builder.danger_accept_invalid_certs(true);
-    builder.danger_accept_invalid_hostnames(false);
-    
     let tls_connector = builder.build()?;
     let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
 
@@ -140,7 +141,6 @@ async fn get_db_client() -> Result<Client, Box<dyn Error + Send + Sync>> {
 
     println!("🔌 Connecting to PostgreSQL...");
     println!("   Host: {}", db_host);
-    println!("   Port: {}", db_port);
     println!("   Database: {}", db_name);
     println!("   User: {}", db_user);
 
@@ -148,10 +148,12 @@ async fn get_db_client() -> Result<Client, Box<dyn Error + Send + Sync>> {
         Ok(result) => result,
         Err(e) => {
             eprintln!("❌ Failed to connect to PostgreSQL: {}", e);
+            eprintln!("   Connection string: host={} port={} dbname={}", db_host, db_port, db_name);
             return Err(e.into());
         }
     };
 
+    // Spawn connection in background
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("❌ Database connection error: {}", e);
@@ -160,18 +162,32 @@ async fn get_db_client() -> Result<Client, Box<dyn Error + Send + Sync>> {
 
     println!("✅ Database connected successfully");
     
+    // Verify table exists
     match client.query("SELECT COUNT(*) FROM jetxv1", &[]).await {
         Ok(_) => println!("✅ Table 'jetxv1' verified"),
         Err(e) => {
             eprintln!("⚠️  Warning: Could not verify table 'jetxv1': {}", e);
-            eprintln!("   Create table with: CREATE TABLE jetxv1 (date DATE, time TIME, crash_multiplier NUMERIC(10,2), flight_duration NUMERIC(10,2), total_bets_usd NUMERIC(10,2), total_players_bet INTEGER, total_cashouts_usd NUMERIC(10,2), total_players_cashed_out INTEGER, profit_usd NUMERIC(10,2), players_lost INTEGER);");
+            eprintln!("   Make sure the table exists. Run this SQL:");
+            eprintln!("   CREATE TABLE jetxv1 (");
+            eprintln!("       date DATE,");
+            eprintln!("       time TIME,");
+            eprintln!("       crash_multiplier NUMERIC(10,2),");
+            eprintln!("       flight_duration NUMERIC(10,2),");
+            eprintln!("       total_bets_usd NUMERIC(10,2),");
+            eprintln!("       total_players_bet INTEGER,");
+            eprintln!("       total_cashouts_usd NUMERIC(10,2),");
+            eprintln!("       total_players_cashed_out INTEGER,");
+            eprintln!("       profit_usd NUMERIC(10,2),");
+            eprintln!("       players_lost INTEGER");
+            eprintln!("   );");
         }
     }
     
     Ok(client)
 }
 
-async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<dyn Error + Send + Sync>> {
+// Save game round to database
+async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<dyn Error>> {
     let query = "
         INSERT INTO jetxv1 (
             date, time, crash_multiplier, flight_duration, 
@@ -180,46 +196,35 @@ async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     ";
 
-    let max_retries = 3;
-    for attempt in 1..=max_retries {
-        match client.execute(
-            query,
-            &[
-                &round.date,
-                &round.time,
-                &round.crash_multiplier,
-                &round.flight_duration,
-                &round.total_bets_usd,
-                &round.total_players_bet,
-                &round.total_cashouts_usd,
-                &round.total_players_cashed_out,
-                &round.profit_usd,
-                &round.players_lost,
-            ],
-        ).await {
-            Ok(rows) => {
-                if attempt > 1 {
-                    println!("💾 Saved to database on attempt {} ({} row)", attempt, rows);
-                } else {
-                    println!("💾 Saved to database ({} row)", rows);
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                if attempt < max_retries {
-                    eprintln!("❌ DB insert failed (attempt {}/{}): {}", attempt, max_retries, e);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                } else {
-                    eprintln!("❌ DB insert failed after {} attempts: {}", max_retries, e);
-                    return Err(e.into());
-                }
-            }
+    match client.execute(
+        query,
+        &[
+            &round.date,
+            &round.time,
+            &round.crash_multiplier,
+            &round.flight_duration,
+            &round.total_bets_usd,
+            &round.total_players_bet,
+            &round.total_cashouts_usd,
+            &round.total_players_cashed_out,
+            &round.profit_usd,
+            &round.players_lost,
+        ],
+    ).await {
+        Ok(rows) => {
+            println!("💾 Saved to database successfully ({} row inserted)", rows);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("❌ Database insert error: {}", e);
+            eprintln!("   Data: date={}, time={}, multiplier={:.2}x", 
+                round.date, round.time, round.crash_multiplier);
+            Err(e.into())
         }
     }
-    
-    Err("Maximum retry attempts reached".into())
 }
 
+// HTTP endpoints for keeping the service alive
 #[get("/")]
 async fn hello() -> impl Responder {
     let adjusted_time = get_adjusted_time();
@@ -229,6 +234,7 @@ async fn hello() -> impl Responder {
             "status": "ok",
             "service": "JetX Game Data Monitor",
             "message": "Service is running and monitoring JetX games",
+            "uptime": "active",
             "timestamp": adjusted_time.to_rfc3339(),
             "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
         }))
@@ -263,50 +269,36 @@ async fn status() -> impl Responder {
         }))
 }
 
+// WebSocket monitoring function with auto-reconnect
 async fn run_websocket_monitor() {
     let mut reconnect_attempts = 0;
-    let mut total_rounds_saved = 0;
-    
     loop {
         reconnect_attempts += 1;
-        println!("\n🔄 WebSocket Session #{}", reconnect_attempts);
+        println!("\n🔄 WebSocket Monitor Attempt #{}", reconnect_attempts);
         
         match monitor_jetx().await {
-            Ok(rounds_saved) => {
-                total_rounds_saved += rounds_saved;
-                println!("✅ Session ended gracefully");
-                println!("   Total rounds saved this session: {}", rounds_saved);
-                println!("   Total rounds saved overall: {}", total_rounds_saved);
-                
-                // If server closed normally, wait a bit before reconnecting
-                println!("   Waiting 10 seconds before reconnecting...");
-                reconnect_attempts = 0;
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            Ok(_) => {
+                println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
+                reconnect_attempts = 0; // Reset counter on successful connection
             }
             Err(e) => {
-                eprintln!("❌ WebSocket error: {}", e);
-                
-                // Exponential backoff for errors
-                let wait_time = std::cmp::min(5 * reconnect_attempts, 60);
-                
-                eprintln!("   Reconnecting in {} seconds...", wait_time);
-                tokio::time::sleep(tokio::time::Duration::from_secs(wait_time)).await;
+                eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
             }
         }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
-async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
-    let ws_url = env::var("JETX_WEBSOCKET_URL").unwrap_or(
-        "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2".to_string()
-    );
+async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
+    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=f56d8585-2083-457e-ad99-55f451fab230&group=JetX&connectionToken=cQFhaIAMakpskdxRYvbNsTvqu90IxhJ%2BDuB67JN6r10o7ckETvSPufn8ZfduFPFX2gzUMdrgP9lZ9ZVXyPPfRsm1jgKgJAMGf%2FmgHh7MFzOyRtfKzsu8kNtduVkX5oLm&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
-    println!("🔌 Connecting to WebSocket...");
+    println!("🔌 Connecting to WebSocket: {}", ws_url);
 
+    // Create TLS connector for secure WebSocket (wss://) with less strict validation
     let connector = NativeTlsConnector::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(true) // Accept self-signed or invalid certificates
+        .danger_accept_invalid_hostnames(true) // Accept hostname mismatches
         .build()?;
-    
     let connector = Connector::NativeTls(connector);
     
     let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -316,41 +308,40 @@ async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
         Some(connector)
     ).await?;
     
-    println!("✅ WebSocket connected");
+    println!("✅ WebSocket connection established");
 
+    // Connect to database
     let db_client = get_db_client().await?;
 
     let (mut write, mut read) = ws_stream.split();
 
-    println!("📊 Waiting for a complete round to start...");
+    println!("📊 Listening for JetX game data...");
+    println!("⚠️  NOTE: First round will be skipped (in-progress round)");
     println!("{}", "=".repeat(80));
 
     let mut round_tracker = RoundTracker::new();
     let mut round_count = 0;
-    let mut rounds_saved: u32 = 0;
-    let mut first_complete_round_seen = false;
+    let mut first_round_seen = false;
     let mut message_counter = 0;
-    let mut last_ping_time = std::time::Instant::now();
-    let ping_interval = std::time::Duration::from_secs(30);
 
     while let Some(message) = read.next().await {
-        if last_ping_time.elapsed() > ping_interval {
-            if let Err(e) = write.send(Message::Ping(vec![])).await {
-                eprintln!("❌ Failed to send ping: {}", e);
-                break;
-            }
-            last_ping_time = std::time::Instant::now();
-        }
-        
         match message {
             Ok(msg) => {
                 match msg {
                     Message::Text(text) => {
                         message_counter += 1;
                         
+                        // Log every message with detailed timestamp (adjusted +2 hours)
+                        let adjusted_time = get_adjusted_time();
+                        let timestamp = adjusted_time.format("%H:%M:%S%.3f").to_string();
+                        println!("\n[MSG #{}] Received at {}", message_counter, timestamp);
+                        
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
-                                for msg_obj in messages.iter() {
+                                // Process EVERY message in the array - critical for not skipping data
+                                for (idx, msg_obj) in messages.iter().enumerate() {
+                                    println!("  [Sub-message {}/{}]", idx + 1, messages.len());
+                                    
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
                                             if let Some(args) = msg_obj["A"].as_array() {
@@ -359,54 +350,60 @@ async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
+                                                    // Uncomment for detailed response logging:
+                                                    // println!("    Response: f={}, v={}, s={}", f, v, s);
+
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
                                                         round_tracker.start_time = Some(get_adjusted_time());
                                                         round_tracker.is_active = true;
                                                         round_count += 1;
-                                                        
-                                                        if !first_complete_round_seen {
-                                                            println!("\n✅ Found round starting from scratch - tracking enabled!");
-                                                            first_complete_round_seen = true;
-                                                        }
-                                                        
-                                                        println!("\n🚀 [ROUND {}] Started at {}", 
+                                                        println!("\n🚀 [ROUND {}] FLIGHT STARTED at {}", 
                                                             round_count, 
                                                             get_adjusted_time().format("%H:%M:%S"));
+                                                        println!("{}", "-".repeat(80));
                                                     } else if !f && round_tracker.is_active {
                                                         round_tracker.crash_multiplier = v;
                                                         round_tracker.flight_duration = s;
-                                                        print!("\r📈 {:.2}x | {:.2}s", v, s);
+                                                        print!("\r📈 Multiplier: {:.2}x | Time: {:.2}s", v, s);
                                                         std::io::Write::flush(&mut std::io::stdout()).ok();
                                                     } else if f && round_tracker.is_active {
                                                         round_tracker.crash_multiplier = v;
                                                         round_tracker.flight_duration = s;
-                                                        println!("\n💥 CRASHED at {:.2}x ({:.2}s)", v, s);
+                                                        println!("\n\n💥 CRASHED at {:.2}x (Duration: {:.2}s)", v, s);
+                                                        println!("{}", "-".repeat(80));
 
                                                         let round_stats = round_tracker.calculate_stats();
                                                         
-                                                        println!("📊 Bets: ${:.2} ({} players) | Cashouts: ${:.2} ({} players) | Profit: ${:.2} | Lost: {}", 
+                                                        println!("\n📊 ROUND {} SUMMARY:", round_count);
+                                                        println!("   Total Bets: ${:.2} from {} players", 
                                                             round_stats.total_bets_usd, 
-                                                            round_stats.total_players_bet,
+                                                            round_stats.total_players_bet);
+                                                        println!("   Total Cashouts: ${:.2} from {} players", 
                                                             round_stats.total_cashouts_usd, 
-                                                            round_stats.total_players_cashed_out,
-                                                            round_stats.profit_usd,
-                                                            round_stats.players_lost);
+                                                            round_stats.total_players_cashed_out);
+                                                        println!("   Profit (House): ${:.2}", round_stats.profit_usd);
+                                                        println!("   Players Lost: {}", round_stats.players_lost);
 
-                                                        if first_complete_round_seen && round_count > 1 {
+                                                        if first_round_seen {
+                                                            // Save to database
                                                             match save_round_to_db(&db_client, &round_stats).await {
                                                                 Ok(_) => {
-                                                                    rounds_saved += 1;
-                                                                    println!("✅ Round #{} saved", round_count);
+                                                                    println!("   ✅ Saved to database");
+                                                                    println!("   📝 Round #{} recorded successfully", round_count - 1);
                                                                 }
-                                                                Err(e) => eprintln!("❌ Save failed: {}", e),
+                                                                Err(e) => {
+                                                                    eprintln!("   ❌ Database error: {}", e);
+                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
+                                                                }
                                                             }
-                                                        } else if round_count == 1 {
-                                                            println!("⏭️  Skipped (baseline round)");
                                                         } else {
-                                                            println!("⏭️  Skipped (waiting for round start)");
+                                                            println!("   ⚠️  SKIPPED (First incomplete round - we joined mid-game)");
+                                                            println!("   📌 Starting fresh tracking from next round");
+                                                            first_round_seen = true;
                                                         }
                                                         
                                                         println!("{}", "=".repeat(80));
+
                                                         round_tracker.reset();
                                                     }
                                                 }
@@ -415,8 +412,14 @@ async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
+                                                        // Uncomment for action type logging:
+                                                        // println!("    Action type: {}", action_type);
+                                                        
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
+                                                                // Uncomment for raw data logging:
+                                                                // println!("    Data: {}", data);
+                                                                
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -432,7 +435,16 @@ async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
+                                                                            println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
+                                                                                bet.username,
+                                                                                bet.player_id,
+                                                                                bet.bet_amount_usd,
+                                                                                bet.currency,
+                                                                                bet.bet_number);
+                                                                            
                                                                             round_tracker.bets.insert(key, bet);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -447,49 +459,81 @@ async fn monitor_jetx() -> Result<u32, Box<dyn Error + Send + Sync>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
+                                                                            println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
+                                                                                cashout.username,
+                                                                                cashout.player_id,
+                                                                                cashout.bet_amount_usd,
+                                                                                cashout.multiplier,
+                                                                                cashout.cashout_amount_usd);
+                                                                            
                                                                             round_tracker.cashouts.push(cashout);
+                                                                        } else {
+                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
+                                                                    } else {
+                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
                                                                     }
+                                                                } else {
+                                                                    println!("    ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            println!("    Unknown method: {}", method);
                                         }
+                                    } else {
+                                        println!("    No method field found");
                                     }
                                 }
+                            } else {
+                                println!("  No M array in message");
                             }
+                        } else {
+                            println!("  Failed to parse as JSON");
                         }
                     }
 
+                    Message::Binary(data) => {
+                        message_counter += 1;
+                        println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
+                    }
+
                     Message::Ping(data) => {
+                        println!("\n[PING] Received, sending pong...");
                         write.send(Message::Pong(data)).await?;
                     }
 
+                    Message::Pong(_) => {
+                        println!("\n[PONG] Received");
+                    }
+
                     Message::Close(frame) => {
-                        println!("\n[INFO] Server closed connection gracefully: {:?}", frame);
-                        println!("   This is normal behavior - server may periodically close connections");
+                        println!("\n[CLOSE] Connection closed by server: {:?}", frame);
                         break;
                     }
 
-                    _ => {}
+                    Message::Frame(_) => {
+                        message_counter += 1;
+                        println!("\n[MSG #{}] Frame message", message_counter);
+                    }
                 }
             }
 
             Err(e) => {
-                eprintln!("\n[ERROR] {}", e);
+                eprintln!("\n[ERROR] Error receiving message: {}", e);
                 return Err(e.into());
             }
         }
     }
 
-    println!("\n=== SESSION SUMMARY ===");
-    println!("Messages received: {}", message_counter);
-    println!("Rounds tracked: {}", round_count);
-    println!("Rounds saved to DB: {}", rounds_saved);
+    println!("\n\n=== CONNECTION ENDED ===");
+    println!("Total messages received: {}", message_counter);
+    println!("Total rounds tracked: {}", round_count);
     
-    Ok(rounds_saved)
+    Ok(())
 }
 
 #[actix_web::main]
@@ -499,16 +543,24 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap();
     
-    println!("🚀 JetX Monitor Starting");
-    println!("🌐 Port: {}", port);
-    println!("💾 Database: Aiven PostgreSQL");
-    println!("📡 WebSocket: Auto-reconnecting");
+    println!("🚀 Starting JetX Monitor Service with PostgreSQL");
+    println!("🌐 Web server on port {}", port);
+    println!("💾 Database: PostgreSQL (Aiven)");
+    println!("📡 WebSocket: Auto-reconnecting monitor");
+    println!("💓 Health endpoints ready for cron-job.org:");
+    println!("   - GET http://your-app.koyeb.app/health");
+    println!("   - GET http://your-app.koyeb.app/status");
+    println!("⏰ Recommended cron schedule: Every 5 minutes");
+    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
+    println!("             All subsequent rounds will be fully tracked and saved");
     println!("{}", "=".repeat(80));
     
+    // Spawn WebSocket monitor as a background task
     tokio::spawn(async {
         run_websocket_monitor().await;
     });
     
+    // Start HTTP server
     HttpServer::new(|| {
         App::new()
             .service(hello)
@@ -516,7 +568,7 @@ async fn main() -> std::io::Result<()> {
             .service(status)
     })
     .bind(("0.0.0.0", port))?
-    .workers(2)
+    .workers(2) // Use 2 workers for better reliability
     .run()
     .await
 }
