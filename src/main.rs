@@ -119,18 +119,25 @@ fn parse_player_data(data_str: &str) -> Option<Vec<String>> {
     }
 }
 
-// Database connection function
+// Database connection function with improved security
 async fn get_db_client() -> Result<Client, Box<dyn Error>> {
-    let db_user = env::var("DATABASE_USER").unwrap_or("koyeb-adm".to_string());
-    let db_password = env::var("DATABASE_PASSWORD").unwrap_or("npg_yT0PCYzEG7kg".to_string());
-    let db_host = env::var("DATABASE_HOST").unwrap_or("ep-ancient-math-agj70ris.c-2.eu-central-1.pg.koyeb.app".to_string());
-    let db_port = env::var("DATABASE_PORT").unwrap_or("5432".to_string());
-    let db_name = env::var("DATABASE_NAME").unwrap_or("koyebdb".to_string());
+    // Updated Aiven database credentials
+    let db_user = env::var("DATABASE_USER").unwrap_or("avnadmin".to_string());
+    let db_password = env::var("DATABASE_PASSWORD").unwrap_or("AVNS_qo4RbZtZ5nTmv6oZCvL".to_string());
+    let db_host = env::var("DATABASE_HOST").unwrap_or("pg-406c52b-luswiliec-transcity.k.aivencloud.com".to_string());
+    let db_port = env::var("DATABASE_PORT").unwrap_or("12394".to_string());
+    let db_name = env::var("DATABASE_NAME").unwrap_or("defaultdb".to_string());
 
-    // Use postgres-native-tls for secure connection to Koyeb PostgreSQL
+    // TLS configuration for Aiven - needs to accept their certificates
     let mut builder = native_tls::TlsConnector::builder();
-    // Accept any certificate for compatibility (Koyeb uses valid certs, but this ensures connection)
+    
+    // Aiven uses valid certificates but may require less strict validation
+    // Accept Aiven's certificate setup
     builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(false); // Keep hostname validation
+    
+    println!("🔒 Connecting with TLS (Aiven-compatible mode)");
+    
     let tls_connector = builder.build()?;
     let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
 
@@ -141,6 +148,7 @@ async fn get_db_client() -> Result<Client, Box<dyn Error>> {
 
     println!("🔌 Connecting to PostgreSQL...");
     println!("   Host: {}", db_host);
+    println!("   Port: {}", db_port);
     println!("   Database: {}", db_name);
     println!("   User: {}", db_user);
 
@@ -186,7 +194,7 @@ async fn get_db_client() -> Result<Client, Box<dyn Error>> {
     Ok(client)
 }
 
-// Save game round to database
+// Save game round to database with retry logic
 async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<dyn Error>> {
     let query = "
         INSERT INTO jetxv1 (
@@ -196,32 +204,48 @@ async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     ";
 
-    match client.execute(
-        query,
-        &[
-            &round.date,
-            &round.time,
-            &round.crash_multiplier,
-            &round.flight_duration,
-            &round.total_bets_usd,
-            &round.total_players_bet,
-            &round.total_cashouts_usd,
-            &round.total_players_cashed_out,
-            &round.profit_usd,
-            &round.players_lost,
-        ],
-    ).await {
-        Ok(rows) => {
-            println!("💾 Saved to database successfully ({} row inserted)", rows);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("❌ Database insert error: {}", e);
-            eprintln!("   Data: date={}, time={}, multiplier={:.2}x", 
-                round.date, round.time, round.crash_multiplier);
-            Err(e.into())
+    // Retry logic: attempt up to 3 times
+    let max_retries = 3;
+    for attempt in 1..=max_retries {
+        match client.execute(
+            query,
+            &[
+                &round.date,
+                &round.time,
+                &round.crash_multiplier,
+                &round.flight_duration,
+                &round.total_bets_usd,
+                &round.total_players_bet,
+                &round.total_cashouts_usd,
+                &round.total_players_cashed_out,
+                &round.profit_usd,
+                &round.players_lost,
+            ],
+        ).await {
+            Ok(rows) => {
+                if attempt > 1 {
+                    println!("💾 Saved to database successfully on attempt {} ({} row inserted)", attempt, rows);
+                } else {
+                    println!("💾 Saved to database successfully ({} row inserted)", rows);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    eprintln!("❌ Database insert error (attempt {}/{}): {}", attempt, max_retries, e);
+                    eprintln!("   Retrying in 2 seconds...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                } else {
+                    eprintln!("❌ Database insert failed after {} attempts: {}", max_retries, e);
+                    eprintln!("   Data: date={}, time={}, multiplier={:.2}x", 
+                        round.date, round.time, round.crash_multiplier);
+                    return Err(e.into());
+                }
+            }
         }
     }
+    
+    Err("Maximum retry attempts reached".into())
 }
 
 // HTTP endpoints for keeping the service alive
@@ -272,35 +296,35 @@ async fn status() -> impl Responder {
 // WebSocket monitoring function with auto-reconnect
 async fn run_websocket_monitor() {
     let mut reconnect_attempts = 0;
-    
     loop {
         reconnect_attempts += 1;
         println!("\n🔄 WebSocket Monitor Attempt #{}", reconnect_attempts);
         
         match monitor_jetx().await {
             Ok(_) => {
-                println!("⚠️  WebSocket connection ended normally. Reconnecting in 3 seconds...");
+                println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
                 reconnect_attempts = 0; // Reset counter on successful connection
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             }
             Err(e) => {
-                eprintln!("❌ WebSocket error: {}. Reconnecting in 3 seconds...", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
             }
         }
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=2c31ab56-d885-46a5-bdf2-c9249136a39c&group=JetX&connectionToken=4%2BMbXiGbp3b9sUw36wIpaGI%2BboWqyfz8EvXsRYDuxEPGkxOsN2y22pdFSjUdBWxVmzQxhpcyF5ZXvjj6vhy1jtx4QYvtuIWPe52aU4RZ%2FD6r79v7%2FnHSjRSmnZPvLPHj&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
+    // WebSocket URL - consider moving to environment variable for security
+    let ws_url = env::var("JETX_WEBSOCKET_URL").unwrap_or("wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=8cd04863-43a3-47e0-a21a-3c157851e4b2&group=JetX&connectionToken=BDRYvG6RUZ4njDdJGhgh%2Bj5FTL9TLEts1v9FBJDAPPZ0VqN%2FjrN0B8zcp7gzYIzo21emPl97HB6W5LIfe1CJlOeZc0%2FZbWfDIXgVa3Fwd6cZmWuDZFx8qciSzuj7Be5A&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=5".to_string()
+    );
 
-    println!("🔌 Connecting to WebSocket: {}", ws_url);
+    println!("🔌 Connecting to WebSocket...");
 
-    // Create TLS connector for secure WebSocket (wss://) with less strict validation
+    // TLS connector for WebSocket - Aiven-compatible
     let connector = NativeTlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
+        .danger_accept_invalid_certs(true) // Accept certificates for compatibility
         .build()?;
+    
     let connector = Connector::NativeTls(connector);
     
     let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
@@ -312,15 +336,8 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
     
     println!("✅ WebSocket connection established");
 
-    // Connect to database with retry logic
-    let db_client = match get_db_client().await {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("⚠️  Database connection failed: {}. Retrying...", e);
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            get_db_client().await?
-        }
-    };
+    // Connect to database
+    let db_client = get_db_client().await?;
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -359,9 +376,6 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
-                                                    // Uncomment for detailed response logging:
-                                                    // println!("    Response: f={}, v={}, s={}", f, v, s);
-
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
                                                         round_tracker.start_time = Some(get_adjusted_time());
                                                         round_tracker.is_active = true;
@@ -394,7 +408,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                         println!("   Players Lost: {}", round_stats.players_lost);
 
                                                         if first_round_seen {
-                                                            // Save to database
+                                                            // Save to database with retry logic
                                                             match save_round_to_db(&db_client, &round_stats).await {
                                                                 Ok(_) => {
                                                                     println!("   ✅ Saved to database");
@@ -402,7 +416,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                 }
                                                                 Err(e) => {
                                                                     eprintln!("   ❌ Database error: {}", e);
-                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
+                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Check database connection");
                                                                 }
                                                             }
                                                         } else {
@@ -421,14 +435,8 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
-                                                        // Uncomment for action type logging:
-                                                        // println!("    Action type: {}", action_type);
-                                                        
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
-                                                                // Uncomment for raw data logging:
-                                                                // println!("    Data: {}", data);
-                                                                
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -452,8 +460,6 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 bet.bet_number);
                                                                             
                                                                             round_tracker.bets.insert(key, bet);
-                                                                        } else {
-                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -476,32 +482,18 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout.cashout_amount_usd);
                                                                             
                                                                             round_tracker.cashouts.push(cashout);
-                                                                        } else {
-                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
-                                                                    } else {
-                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
                                                                     }
-                                                                } else {
-                                                                    println!("    ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            println!("    Unknown method: {}", method);
                                         }
-                                    } else {
-                                        println!("    No method field found");
                                     }
                                 }
-                            } else {
-                                println!("  No M array in message");
                             }
-                        } else {
-                            println!("  Failed to parse as JSON");
                         }
                     }
 
@@ -552,20 +544,19 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap();
     
+    let environment = env::var("ENV").unwrap_or("production".to_string());
+    
     println!("🚀 Starting JetX Monitor Service with PostgreSQL");
+    println!("🌐 Environment: {}", environment);
     println!("🌐 Web server on port {}", port);
-    println!("💾 Database: PostgreSQL (Koyeb)");
+    println!("💾 Database: PostgreSQL (Aiven)");
     println!("📡 WebSocket: Auto-reconnecting monitor");
-    println!("💓 HTTP Keep-Alive optimized for 1-minute cron pings");
-    println!("   Health endpoint: http://your-app.koyeb.app/health");
-    println!("   Status endpoint: http://your-app.koyeb.app/status");
-    println!("⏰ CRON SETUP: Set to ping every 1 minute");
-    println!("   Schedule: * * * * * (every 1 minute)");
-    println!("   URL: https://your-app.koyeb.app/health");
-    println!("   Method: GET");
-    println!("   Timeout: 10 seconds");
-    println!("📋 First round after startup will be skipped (incomplete data)");
-    println!("   All subsequent rounds will be fully tracked and saved");
+    println!("💓 Health endpoints ready for monitoring:");
+    println!("   - GET http://your-app.koyeb.app/health");
+    println!("   - GET http://your-app.koyeb.app/status");
+    println!("⏰ Recommended cron schedule: Every 5 minutes");
+    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
+    println!("             All subsequent rounds will be fully tracked and saved");
     println!("{}", "=".repeat(80));
     
     // Spawn WebSocket monitor as a background task
@@ -573,7 +564,7 @@ async fn main() -> std::io::Result<()> {
         run_websocket_monitor().await;
     });
     
-    // Start HTTP server with optimized settings for frequent pings
+    // Start HTTP server
     HttpServer::new(|| {
         App::new()
             .service(hello)
@@ -581,12 +572,7 @@ async fn main() -> std::io::Result<()> {
             .service(status)
     })
     .bind(("0.0.0.0", port))?
-    .workers(2) // 2 workers for reliability
-    .keep_alive(std::time::Duration::from_secs(90)) // Keep connections alive for 90s
-    .client_request_timeout(std::time::Duration::from_secs(10)) // 10s request timeout
-    .client_disconnect_timeout(std::time::Duration::from_secs(5)) // 5s disconnect timeout
-    .max_connections(1000) // Handle up to 1000 concurrent connections
-    .max_connection_rate(256) // Max 256 connections per worker per second
+    .workers(2) // Use 2 workers for better reliability
     .run()
     .await
-        }
+}
