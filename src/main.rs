@@ -338,9 +338,12 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                         
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
+                                let total_messages = messages.len();
+                                println!("  📦 Processing {} sub-messages in this batch", total_messages);
+                                
                                 // Process EVERY message in the array - critical for not skipping data
                                 for (idx, msg_obj) in messages.iter().enumerate() {
-                                    println!("  [Sub-message {}/{}]", idx + 1, messages.len());
+                                    println!("  [Sub-message {}/{}]", idx + 1, total_messages);
                                     
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
@@ -435,7 +438,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
-                                                                            println!("\n💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
+                                                                            println!("      💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
                                                                                 bet.username,
                                                                                 bet.player_id,
                                                                                 bet.bet_amount_usd,
@@ -444,7 +447,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             
                                                                             round_tracker.bets.insert(key, bet);
                                                                         } else {
-                                                                            println!("    ⚠️  Invalid bet (mult or cashout not 0)");
+                                                                            println!("      ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -459,7 +462,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
-                                                                            println!("\n✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
+                                                                            println!("      ✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
                                                                                 cashout.username,
                                                                                 cashout.player_id,
                                                                                 cashout.bet_amount_usd,
@@ -468,13 +471,13 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             
                                                                             round_tracker.cashouts.push(cashout);
                                                                         } else {
-                                                                            println!("    ⚠️  Invalid cashout (mult or cashout is 0)");
+                                                                            println!("      ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
                                                                     } else {
-                                                                        println!("    ⚠️  Unrecognized action or incomplete data");
+                                                                        println!("      ⚠️  Unrecognized action or incomplete data");
                                                                     }
                                                                 } else {
-                                                                    println!("    ⚠️  Failed to parse player data");
+                                                                    println!("      ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
