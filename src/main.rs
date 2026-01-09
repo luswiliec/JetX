@@ -290,7 +290,7 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w4.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=88640c3b-4c39-46e0-817d-2f2f5dfbf735&group=JetX&connectionToken=UDY7eGm9nQatdwaV3tcVmPQBpI5NxL4FoHvKZsIZTXa%2B4RvEEcX4mAPLVBYO9qJx8VJZfSWeUOMmrJWRYZzzH2Sohlc7KQoekQxQ%2BDdIenDprI0LPnAvyRUJpS9LJH9x&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
+    let ws_url = "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=7f854388-e80e-49d2-bf10-998d69879ce0&group=JetX&connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u%2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
 
     println!("🔌 Connecting to WebSocket: {}", ws_url);
 
