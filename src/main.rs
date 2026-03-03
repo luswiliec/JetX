@@ -11,6 +11,8 @@ use actix_web::{get, App, HttpResponse, HttpServer, Responder};
 use tokio_postgres::Client;
 use postgres_native_tls;
 use native_tls::TlsConnector as NativeTlsConnector;
+use reqwest;
+use url::form_urlencoded;
 
 // Helper function to add 2 hours to current time
 fn get_adjusted_time() -> DateTime<Utc> {
@@ -92,7 +94,6 @@ impl RoundTracker {
         };
         let profit_usd = total_bets_usd - total_cashouts_usd;
 
-        // Use start_time directly (already adjusted when stored)
         let adjusted_time = self.start_time.unwrap_or_else(get_adjusted_time);
         
         GameRound {
@@ -119,6 +120,45 @@ fn parse_player_data(data_str: &str) -> Option<Vec<String>> {
     }
 }
 
+// NEW: Function to get fresh SignalR connection token
+async fn get_signalr_token() -> Result<String, Box<dyn Error>> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?;
+
+    // Step 1: Negotiate connection
+    let negotiate_url = "https://eu-server-w15.ssgportal.com/JetXNode703/signalr/negotiate?clientProtocol=1.5&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D";
+    
+    println!("🔑 Requesting fresh SignalR token...");
+    
+    let response = client
+        .get(negotiate_url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(format!("Negotiate failed: {}", response.status()).into());
+    }
+
+    let json: Value = response.json().await?;
+    
+    let connection_token = json["ConnectionToken"]
+        .as_str()
+        .ok_or("No ConnectionToken in response")?;
+    
+    let connection_id = json["ConnectionId"]
+        .as_str()
+        .ok_or("No ConnectionId in response")?;
+
+    println!("✅ Got fresh token (Connection ID: {})", connection_id);
+
+    // URL encode the connection token
+    let encoded_token: String = form_urlencoded::byte_serialize(connection_token.as_bytes()).collect();
+
+    Ok(encoded_token)
+}
+
 // Database connection function
 async fn get_db_client() -> Result<Client, Box<dyn Error>> {
     let db_user = env::var("DATABASE_USER").unwrap_or("avnadmin".to_string());
@@ -127,9 +167,7 @@ async fn get_db_client() -> Result<Client, Box<dyn Error>> {
     let db_port = env::var("DATABASE_PORT").unwrap_or("12394".to_string());
     let db_name = env::var("DATABASE_NAME").unwrap_or("defaultdb".to_string());
 
-    // Use postgres-native-tls for secure connection to Aiven PostgreSQL
     let mut builder = native_tls::TlsConnector::builder();
-    // Accept any certificate for compatibility (Aiven uses valid certs, but this ensures connection)
     builder.danger_accept_invalid_certs(true);
     let tls_connector = builder.build()?;
     let tls = postgres_native_tls::MakeTlsConnector::new(tls_connector);
@@ -140,20 +178,9 @@ async fn get_db_client() -> Result<Client, Box<dyn Error>> {
     );
 
     println!("🔌 Connecting to PostgreSQL...");
-    println!("   Host: {}", db_host);
-    println!("   Database: {}", db_name);
-    println!("   User: {}", db_user);
 
-    let (client, connection) = match tokio_postgres::connect(&connection_string, tls).await {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("❌ Failed to connect to PostgreSQL: {}", e);
-            eprintln!("   Connection string: host={} port={} dbname={}", db_host, db_port, db_name);
-            return Err(e.into());
-        }
-    };
+    let (client, connection) = tokio_postgres::connect(&connection_string, tls).await?;
 
-    // Spawn connection in background
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("❌ Database connection error: {}", e);
@@ -162,31 +189,9 @@ async fn get_db_client() -> Result<Client, Box<dyn Error>> {
 
     println!("✅ Database connected successfully");
     
-    // Verify table exists
-    match client.query("SELECT COUNT(*) FROM jetxv1", &[]).await {
-        Ok(_) => println!("✅ Table 'jetxv1' verified"),
-        Err(e) => {
-            eprintln!("⚠️  Warning: Could not verify table 'jetxv1': {}", e);
-            eprintln!("   Make sure the table exists. Run this SQL:");
-            eprintln!("   CREATE TABLE jetxv1 (");
-            eprintln!("       date DATE,");
-            eprintln!("       time TIME,");
-            eprintln!("       crash_multiplier NUMERIC(10,2),");
-            eprintln!("       flight_duration NUMERIC(10,2),");
-            eprintln!("       total_bets_usd NUMERIC(10,2),");
-            eprintln!("       total_players_bet INTEGER,");
-            eprintln!("       total_cashouts_usd NUMERIC(10,2),");
-            eprintln!("       total_players_cashed_out INTEGER,");
-            eprintln!("       profit_usd NUMERIC(10,2),");
-            eprintln!("       players_lost INTEGER");
-            eprintln!("   );");
-        }
-    }
-    
     Ok(client)
 }
 
-// Save game round to database
 async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<dyn Error>> {
     let query = "
         INSERT INTO jetxv1 (
@@ -196,7 +201,7 @@ async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
     ";
 
-    match client.execute(
+    client.execute(
         query,
         &[
             &round.date,
@@ -210,21 +215,12 @@ async fn save_round_to_db(client: &Client, round: &GameRound) -> Result<(), Box<
             &round.profit_usd,
             &round.players_lost,
         ],
-    ).await {
-        Ok(rows) => {
-            println!("💾 Saved to database successfully ({} row inserted)", rows);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("❌ Database insert error: {}", e);
-            eprintln!("   Data: date={}, time={}, multiplier={:.2}x", 
-                round.date, round.time, round.crash_multiplier);
-            Err(e.into())
-        }
-    }
+    ).await?;
+
+    println!("💾 Saved to database successfully");
+    Ok(())
 }
 
-// HTTP endpoints for keeping the service alive
 #[get("/")]
 async fn hello() -> impl Responder {
     let adjusted_time = get_adjusted_time();
@@ -234,42 +230,28 @@ async fn hello() -> impl Responder {
             "status": "ok",
             "service": "JetX Game Data Monitor",
             "message": "Service is running and monitoring JetX games",
-            "uptime": "active",
             "timestamp": adjusted_time.to_rfc3339(),
-            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
         }))
 }
 
 #[get("/health")]
 async fn health() -> impl Responder {
-    let adjusted_time = get_adjusted_time();
     HttpResponse::Ok()
         .content_type("application/json")
         .json(serde_json::json!({
             "status": "healthy",
-            "service": "jetx-monitor",
-            "database": "connected",
-            "websocket": "active",
-            "timestamp": adjusted_time.to_rfc3339(),
-            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
         }))
 }
 
 #[get("/status")]
 async fn status() -> impl Responder {
-    let adjusted_time = get_adjusted_time();
     HttpResponse::Ok()
         .content_type("application/json")
         .json(serde_json::json!({
             "status": "monitoring",
-            "service": "JetX WebSocket Monitor",
-            "description": "Tracking game rounds and saving to PostgreSQL",
-            "timestamp": adjusted_time.to_rfc3339(),
-            "local_time": adjusted_time.format("%Y-%m-%d %H:%M:%S").to_string()
         }))
 }
 
-// WebSocket monitoring function with auto-reconnect
 async fn run_websocket_monitor() {
     let mut reconnect_attempts = 0;
     loop {
@@ -278,8 +260,8 @@ async fn run_websocket_monitor() {
         
         match monitor_jetx().await {
             Ok(_) => {
-                println!("⚠️  WebSocket connection ended normally. Reconnecting in 5 seconds...");
-                reconnect_attempts = 0; // Reset counter on successful connection
+                println!("⚠️  WebSocket connection ended. Reconnecting in 5 seconds...");
+                reconnect_attempts = 0;
             }
             Err(e) => {
                 eprintln!("❌ WebSocket error: {}. Reconnecting in 5 seconds...", e);
@@ -290,19 +272,25 @@ async fn run_websocket_monitor() {
 }
 
 async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
-    let ws_url = "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&token=7f854388-e80e-49d2-bf10-998d69879ce0&group=JetX&connectionToken=3fwTFY%2FaFBDxgVzCELGL11e18VfMndoJ9uGPP46WWhkXgkxEtM0GrX2fDFruh1u%2BBfgPJtstxnVFMUUO2NSOe3JJpEDUXPvjaVYbvHI9gxdsrL6uu4%2B2P0PU7W8FOpBI&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D&tid=2";
+    // Get fresh token
+    let connection_token = get_signalr_token().await?;
 
-    println!("🔌 Connecting to WebSocket: {}", ws_url);
+    // Build WebSocket URL with fresh token
+    let ws_url = format!(
+        "wss://eu-server-w15.ssgportal.com/JetXNode703/signalr/connect?transport=webSockets&clientProtocol=1.5&connectionToken={}&connectionData=%5B%7B%22name%22%3A%22h%22%7D%5D",
+        connection_token
+    );
 
-    // Create TLS connector for secure WebSocket (wss://) with less strict validation
+    println!("🔌 Connecting to WebSocket...");
+
     let connector = NativeTlsConnector::builder()
-        .danger_accept_invalid_certs(true) // Accept self-signed or invalid certificates
-        .danger_accept_invalid_hostnames(true) // Accept hostname mismatches
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
         .build()?;
     let connector = Connector::NativeTls(connector);
     
     let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-        ws_url,
+        &ws_url,
         None,
         false,
         Some(connector)
@@ -310,41 +298,24 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
     
     println!("✅ WebSocket connection established");
 
-    // Connect to database
     let db_client = get_db_client().await?;
-
     let (mut write, mut read) = ws_stream.split();
 
     println!("📊 Listening for JetX game data...");
-    println!("⚠️  NOTE: First round will be skipped (in-progress round)");
     println!("{}", "=".repeat(80));
 
     let mut round_tracker = RoundTracker::new();
     let mut round_count = 0;
     let mut first_round_seen = false;
-    let mut message_counter = 0;
 
     while let Some(message) = read.next().await {
         match message {
             Ok(msg) => {
                 match msg {
                     Message::Text(text) => {
-                        message_counter += 1;
-                        
-                        // Log every message with detailed timestamp (adjusted +2 hours)
-                        let adjusted_time = get_adjusted_time();
-                        let timestamp = adjusted_time.format("%H:%M:%S%.3f").to_string();
-                        println!("\n[MSG #{}] Received at {}", message_counter, timestamp);
-                        
                         if let Ok(json) = serde_json::from_str::<Value>(&text) {
                             if let Some(messages) = json["M"].as_array() {
-                                let total_messages = messages.len();
-                                println!("  📦 Processing {} sub-messages in this batch", total_messages);
-                                
-                                // Process EVERY message in the array - critical for not skipping data
-                                for (idx, msg_obj) in messages.iter().enumerate() {
-                                    println!("  [Sub-message {}/{}]", idx + 1, total_messages);
-                                    
+                                for msg_obj in messages.iter() {
                                     if let Some(method) = msg_obj["M"].as_str() {
                                         if method == "response" {
                                             if let Some(args) = msg_obj["A"].as_array() {
@@ -353,59 +324,29 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                     let v = arg["v"].as_f64().unwrap_or(0.0);
                                                     let s = arg["s"].as_f64().unwrap_or(0.0);
 
-                                                    // Uncomment for detailed response logging:
-                                                    // println!("    Response: f={}, v={}, s={}", f, v, s);
-
                                                     if !f && v == 1.0 && s == 0.0 && !round_tracker.is_active {
                                                         round_tracker.start_time = Some(get_adjusted_time());
                                                         round_tracker.is_active = true;
                                                         round_count += 1;
-                                                        println!("\n🚀 [ROUND {}] FLIGHT STARTED at {}", 
-                                                            round_count, 
-                                                            get_adjusted_time().format("%H:%M:%S"));
-                                                        println!("{}", "-".repeat(80));
+                                                        println!("\n🚀 [ROUND {}] FLIGHT STARTED", round_count);
                                                     } else if !f && round_tracker.is_active {
                                                         round_tracker.crash_multiplier = v;
                                                         round_tracker.flight_duration = s;
-                                                        print!("\r📈 Multiplier: {:.2}x | Time: {:.2}s", v, s);
-                                                        std::io::Write::flush(&mut std::io::stdout()).ok();
                                                     } else if f && round_tracker.is_active {
                                                         round_tracker.crash_multiplier = v;
                                                         round_tracker.flight_duration = s;
-                                                        println!("\n\n💥 CRASHED at {:.2}x (Duration: {:.2}s)", v, s);
-                                                        println!("{}", "-".repeat(80));
+                                                        println!("\n💥 CRASHED at {:.2}x", v);
 
                                                         let round_stats = round_tracker.calculate_stats();
                                                         
-                                                        println!("\n📊 ROUND {} SUMMARY:", round_count);
-                                                        println!("   Total Bets: ${:.2} from {} players", 
-                                                            round_stats.total_bets_usd, 
-                                                            round_stats.total_players_bet);
-                                                        println!("   Total Cashouts: ${:.2} from {} players", 
-                                                            round_stats.total_cashouts_usd, 
-                                                            round_stats.total_players_cashed_out);
-                                                        println!("   Profit (House): ${:.2}", round_stats.profit_usd);
-                                                        println!("   Players Lost: {}", round_stats.players_lost);
-
                                                         if first_round_seen {
-                                                            // Save to database
-                                                            match save_round_to_db(&db_client, &round_stats).await {
-                                                                Ok(_) => {
-                                                                    println!("   ✅ Saved to database");
-                                                                    println!("   📝 Round #{} recorded successfully", round_count - 1);
-                                                                }
-                                                                Err(e) => {
-                                                                    eprintln!("   ❌ Database error: {}", e);
-                                                                    eprintln!("   ⚠️  DATA NOT SAVED - Will retry on next round");
-                                                                }
+                                                            if let Err(e) = save_round_to_db(&db_client, &round_stats).await {
+                                                                eprintln!("❌ Database error: {}", e);
                                                             }
                                                         } else {
-                                                            println!("   ⚠️  SKIPPED (First incomplete round - we joined mid-game)");
-                                                            println!("   📌 Starting fresh tracking from next round");
+                                                            println!("⚠️  SKIPPED (First round)");
                                                             first_round_seen = true;
                                                         }
-                                                        
-                                                        println!("{}", "=".repeat(80));
 
                                                         round_tracker.reset();
                                                     }
@@ -415,14 +356,8 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                             if let Some(args) = msg_obj["A"].as_array() {
                                                 if let Some(arg) = args.first() {
                                                     if let Some(action_type) = arg["M"].as_str() {
-                                                        // Uncomment for action type logging:
-                                                        // println!("    Action type: {}", action_type);
-                                                        
                                                         if let Some(info) = arg["I"].as_object() {
                                                             if let Some(data) = info.get("a").and_then(|v| v.as_str()) {
-                                                                // Uncomment for raw data logging:
-                                                                // println!("    Data: {}", data);
-                                                                
                                                                 if let Some(parts) = parse_player_data(data) {
                                                                     if action_type == "b" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -438,16 +373,7 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                             };
                                                                             
                                                                             let key = format!("{}_{}", bet.player_id, bet.bet_number);
-                                                                            println!("      💰 BET: {} (ID: {}) placed ${:.2} {} [Bet #{}]",
-                                                                                bet.username,
-                                                                                bet.player_id,
-                                                                                bet.bet_amount_usd,
-                                                                                bet.currency,
-                                                                                bet.bet_number);
-                                                                            
                                                                             round_tracker.bets.insert(key, bet);
-                                                                        } else {
-                                                                            println!("      ⚠️  Invalid bet (mult or cashout not 0)");
                                                                         }
                                                                     } else if action_type == "c" && parts.len() >= 9 {
                                                                         let mult: f64 = parts[3].parse().unwrap_or(0.0);
@@ -462,79 +388,40 @@ async fn monitor_jetx() -> Result<(), Box<dyn Error>> {
                                                                                 cashout_amount_usd: cashout_amt,
                                                                             };
                                                                             
-                                                                            println!("      ✅ CASHOUT: {} (ID: {}) | Bet: ${:.2} | @{:.2}x | Won: ${:.2}",
-                                                                                cashout.username,
-                                                                                cashout.player_id,
-                                                                                cashout.bet_amount_usd,
-                                                                                cashout.multiplier,
-                                                                                cashout.cashout_amount_usd);
-                                                                            
                                                                             round_tracker.cashouts.push(cashout);
-                                                                        } else {
-                                                                            println!("      ⚠️  Invalid cashout (mult or cashout is 0)");
                                                                         }
-                                                                    } else {
-                                                                        println!("      ⚠️  Unrecognized action or incomplete data");
                                                                     }
-                                                                } else {
-                                                                    println!("      ⚠️  Failed to parse player data");
                                                                 }
                                                             }
                                                         }
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            println!("    Unknown method: {}", method);
                                         }
-                                    } else {
-                                        println!("    No method field found");
                                     }
                                 }
-                            } else {
-                                println!("  No M array in message");
                             }
-                        } else {
-                            println!("  Failed to parse as JSON");
                         }
                     }
 
-                    Message::Binary(data) => {
-                        message_counter += 1;
-                        println!("\n[MSG #{}] Binary data received: {} bytes", message_counter, data.len());
-                    }
-
                     Message::Ping(data) => {
-                        println!("\n[PING] Received, sending pong...");
                         write.send(Message::Pong(data)).await?;
                     }
 
-                    Message::Pong(_) => {
-                        println!("\n[PONG] Received");
-                    }
-
-                    Message::Close(frame) => {
-                        println!("\n[CLOSE] Connection closed by server: {:?}", frame);
+                    Message::Close(_) => {
+                        println!("\n[CLOSE] Connection closed by server");
                         break;
                     }
 
-                    Message::Frame(_) => {
-                        message_counter += 1;
-                        println!("\n[MSG #{}] Frame message", message_counter);
-                    }
+                    _ => {}
                 }
             }
 
             Err(e) => {
-                eprintln!("\n[ERROR] Error receiving message: {}", e);
                 return Err(e.into());
             }
         }
     }
-
-    println!("\n\n=== CONNECTION ENDED ===");
-    println!("Total messages received: {}", message_counter);
-    println!("Total rounds tracked: {}", round_count);
     
     Ok(())
 }
@@ -546,24 +433,13 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .unwrap();
     
-    println!("🚀 Starting JetX Monitor Service with PostgreSQL");
+    println!("🚀 Starting JetX Monitor Service");
     println!("🌐 Web server on port {}", port);
-    println!("💾 Database: PostgreSQL (Aiven)");
-    println!("📡 WebSocket: Auto-reconnecting monitor");
-    println!("💓 Health endpoints ready for cron-job.org:");
-    println!("   - GET http://your-app.koyeb.app/health");
-    println!("   - GET http://your-app.koyeb.app/status");
-    println!("⏰ Recommended cron schedule: Every 5 minutes");
-    println!("📋 IMPORTANT: First round after startup will be skipped (incomplete data)");
-    println!("             All subsequent rounds will be fully tracked and saved");
-    println!("{}", "=".repeat(80));
     
-    // Spawn WebSocket monitor as a background task
     tokio::spawn(async {
         run_websocket_monitor().await;
     });
     
-    // Start HTTP server
     HttpServer::new(|| {
         App::new()
             .service(hello)
@@ -571,7 +447,7 @@ async fn main() -> std::io::Result<()> {
             .service(status)
     })
     .bind(("0.0.0.0", port))?
-    .workers(2) // Use 2 workers for better reliability
+    .workers(2)
     .run()
     .await
-}
+                                                        }
