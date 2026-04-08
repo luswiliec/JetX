@@ -1,16 +1,32 @@
 [package]
-name = "jetxv1"
+name = "jetx_scraper"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "jetx_scraper"
+path = "src/main.rs"
+
 [dependencies]
-actix-web = "4"
+# WebSocket client
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tungstenite = "0.21"
+
+# Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
-tokio-postgres = "0.7"
-postgres-native-tls = "0.5"
+
+# JSON parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Colored terminal output
+colored = "2"
+
+# URL handling
+url = "2"
+
+# Futures utilities
 futures-util = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-chrono = "0.4"
-native-tls = "0.2"
+
+[profile.release]
+opt-level = 3
